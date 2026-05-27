@@ -998,6 +998,20 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
 
   // 双脑路由（方案三）：按消息类型分流
   let classification = preClassify;
+
+  // 用户想看东西（"看看咪咪""看看猫""看看照片"等）→ 注入生图指令
+  const wantsViewRE = /看看|想看|瞧瞧|瞅瞅|瞧一瞧|看一下|给我看|发.*(照片|图片|图)/;
+  if (wantsViewRE.test(text) && !/看看你|看看我|看看.*[你人己自]/.test(text)) {
+    const imgFacts = buildImageFacts();
+    const factsHint = imgFacts ? `\n你养的宠物外观：${imgFacts}` : "";
+    messages.push({
+      role: "system",
+      content: `【重要】对方想看你发的东西（照片/图片）。${factsHint ? '你宠物外观是：' + imgFacts : ''}你现在必须调用 generate_image 工具，根据对方想看的内容生成一张照片发给对方。不要找借口说"发了呀""发过了""往上翻翻"，直接调工具生图。`,
+    });
+    // 强制启用工具，提升token预算
+    classification = "complex";
+    console.log(`[img-intent] 检测到用户想看东西，注入生图指令`);
+  }
   // 结束信号或收尾模式 → 强制快速通道，简短告别
   if (isWindingDown && classification !== "simple") {
     classification = "simple";
@@ -1079,7 +1093,7 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
   {
     const alreadyHasImage = peekGeneratedImage() !== null;
     if (!alreadyHasImage) {
-      const imagePromiseRE = /(?:给你看|给你拍|拍了[张一]|拍一[张个]|发给你|发给|发张[图照片]|发个[图照片]|发来[图照片]|发一[张个]|看看.*[样照图猫狗崽它]|照片|上图|看图|图片|\b图\b)/;
+      const imagePromiseRE = /(?:给你看|给你拍|拍了[张一]|拍一[张个]|发给你|发给|发张[图照片]|发个[图照片]|发来[图照片]|发一[张个]|看看.*[样照图猫狗崽它]|照片|上图|看图|图片|\b图\b|发了呀|发过了|发了没|往上翻翻|往上翻|翻一翻)/;
       if (imagePromiseRE.test(reply)) {
         console.log(`[image-fixup] 回复承诺了图片但未调工具，开始兜底...`);
 
@@ -1115,8 +1129,15 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
         }
 
         // 如果步骤2成功生图，保留原始回复（自然有人情味）；只有模型在步骤1乖乖调了工具才用重试回复
+        // 但如果原始回复是"发了呀/往上翻翻"之类的借口，则必须替换
         if (peekGeneratedImage() !== null) {
-          console.log(`[image-fixup] 兜底生图成功，保留原始回复`);
+          const excuseRE = /发了呀|发过了|往上翻翻|往上翻|翻一翻|刚刚.*发|没.*看到/;
+          if (excuseRE.test(reply) && retryReply) {
+            reply = retryReply.replace(/📎\S+/g, "").replace(/[""]/g, "").trim();
+            console.log(`[image-fixup] 原始回复是借口，替换为: ${reply.substring(0, 50)}`);
+          } else {
+            console.log(`[image-fixup] 兜底生图成功，保留原始回复`);
+          }
         } else if (retryReply) {
           reply = retryReply.replace(/📎\S+/g, "").replace(/[""]/g, "").trim();
           console.log(`[image-fixup] 模型重试回复: ${reply.substring(0, 50)}`);
