@@ -1,0 +1,12 @@
+node_modules/
+.env
+data/
+stickers/
+stickers_download/
+temp_stickers/
+*.log
+*.tar.gz
+*.zip
+*.memory-card.json
+.DS_Store
+Thumbs.db

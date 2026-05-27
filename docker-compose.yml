@@ -1,0 +1,19 @@
+services:
+  wechat-ai-friend:
+    build: .
+    container_name: wechat-ai-friend
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./src:/app/src
+      - ./wechat-ai-friend.memory-card.json:/app/wechat-ai-friend.memory-card.json
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - TZ=Asia/Shanghai

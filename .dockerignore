@@ -1,0 +1,7 @@
+node_modules/
+data/
+.git/
+*.md
+.gitignore
+.env.example
+.npmrc
