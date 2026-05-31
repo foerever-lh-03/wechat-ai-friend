@@ -1,9 +1,9 @@
 /**
  * 表情包管理器
- * - 优先：本地缓存（已验证过的优质表情包）+ 用户发送的表情包
- * - 在线：API盒子 + MemeMeow 双源搜索
+ * - 优先：本地分类表情包文件（stickers/，零API成本）
+ * - 其次：用户发送的表情包
+ * - 在线：发表情(fabiaoqing.com)
  * - 后备：微信原生 emoji 代码（如 [捂脸]）
- * - 无需本地文件（表情包存URL，不存文件）
  */
 import https from "node:https";
 import fs from "node:fs";
@@ -14,6 +14,7 @@ import { readJSON, writeJSON } from "./store.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(__dirname, "..", "data");
 const STICKERS_DIR = path.join(DATA_DIR, "stickers");
+const LOCAL_STICKERS_DIR = path.resolve(__dirname, "..", "stickers");
 const USER_STICKERS_FILE = "user_stickers.json";
 
 // 关键词 → 微信 emoji 代码（在线搜索失败时使用）
@@ -47,23 +48,13 @@ const KEYWORD_TO_CATEGORY = {
 
 export class StickerManager {
   constructor() {
-    this._cache = readJSON("sticker_cache.json") || {};
-    this._cacheHits = 0;
     this._userStickers = [];
     this._loadUserStickers();
-    console.log(`[sticker] 多源搜索模式 (缓存${this._cacheSize()}张 + API盒子 + MemeMeow + 用户${this._userStickers.length}张)`);
-  }
-
-  _cacheSize() {
-    let n = 0;
-    for (const urls of Object.values(this._cache)) n += urls.length;
-    return n;
-  }
-
-  _cacheFile() { return "sticker_cache.json"; }
-
-  _saveCache() {
-    writeJSON(this._cacheFile(), this._cache);
+    const localCount = fs.existsSync(LOCAL_STICKERS_DIR) ?
+      fs.readdirSync(LOCAL_STICKERS_DIR, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .reduce((sum, d) => sum + fs.readdirSync(path.join(LOCAL_STICKERS_DIR, d.name)).filter(f => /\.(gif|png|jpg|jpeg|webp)$/i.test(f)).length, 0) : 0;
+    console.log(`[sticker] 本地${localCount}张 + 用户${this._userStickers.length}张 + 发表情(fabiaoqing.com)`);
   }
 
   _loadUserStickers() {
@@ -75,28 +66,17 @@ export class StickerManager {
     fs.mkdirSync(STICKERS_DIR, { recursive: true });
   }
 
-  /** 将成功发送的表情包URL加入缓存 */
-  addToCache(keyword, url) {
-    if (!this._cache[keyword]) this._cache[keyword] = [];
-    if (!this._cache[keyword].includes(url)) {
-      this._cache[keyword].push(url);
-      if (this._cache[keyword].length > 20) {
-        this._cache[keyword] = this._cache[keyword].slice(-20);
-      }
-      this._saveCache();
-    }
-  }
-
   /**
    * 缓存用户发送的表情包文件，后续bot可复用
    * @param {string} filePath - 本地文件路径
    * @param {string[]} keywords - 视觉模型提取的关键词
    */
-  addUserSticker(filePath, keywords) {
+  addUserSticker(filePath, keywords, md5) {
     if (!keywords || keywords.length === 0) return;
     const entry = {
       file: filePath,
       keywords,
+      md5: md5 || null,
       addedAt: Date.now(),
     };
     this._userStickers.push(entry);
@@ -107,6 +87,12 @@ export class StickerManager {
     }
     this._saveUserStickers();
     console.log(`[sticker] 用户表情包已缓存: ${path.basename(filePath)} → ${keywords.join(",")} (共${this._userStickers.length}张)`);
+  }
+
+  /** 检查是否已存在相同MD5的表情包（内容去重） */
+  hasStickerByMD5(md5) {
+    if (!md5) return false;
+    return this._userStickers.some(s => s.md5 === md5);
   }
 
   /**
@@ -138,39 +124,99 @@ export class StickerManager {
   }
 
   /**
-   * 在线搜索表情包，返回全部候选URL列表（最多15张）
-   * 顺序：用户缓存 → url缓存 → API盒子 → MemeMeow
+   * 搜索表情包，返回全部候选列表（最多15张）
+   * 顺序：本地文件 → 用户缓存 → 发表情(fabiaoqing.com)
    */
   async searchOnline(keyword) {
     if (!keyword) return [];
 
     const results = [];
 
-    // 0. 用户表情包（最高优先级，已验证过语境匹配）
+    // 1. 本地表情包文件（最高优先级，分类存储，零API成本）
+    const localStickers = this._searchLocal(keyword);
+    if (localStickers.length > 0) {
+      results.push(...localStickers);
+    }
+
+    // 2. 用户表情包
     const userStickers = this._matchUserStickers(keyword);
     if (userStickers.length > 0) {
       results.push(...userStickers);
     }
 
-    // 1. 本地URL缓存（已验证的好表情包，跳过视觉重检）
-    const cached = this._cache[keyword];
-    if (cached && cached.length > 0) {
-      const pick = [...cached].sort(() => Math.random() - 0.5).slice(0, 5);
-      const cachedList = pick.map(u => ({ url: u, filename: `cached_${Date.now()}.jpg`, fromCache: true }));
-      this._cacheHits++;
-      if (this._cacheHits % 5 === 0) {
-        console.log(`[sticker] 缓存命中${this._cacheHits}次 (共${this._cacheSize()}张)`);
-      }
-      results.push(...cachedList);
-    }
-
     if (results.length >= 8) return results;
 
-    // 2. 在线搜索
+    // 3. 在线搜索
     const online = await this._searchAllSources(keyword);
     results.push(...online);
 
     return results;
+  }
+
+  /** 搜索本地分类表情包文件，关键词→分类目录匹配 */
+  _searchLocal(keyword) {
+    if (!keyword || !fs.existsSync(LOCAL_STICKERS_DIR)) return [];
+
+    const kw = keyword.toLowerCase();
+    const matchedCategories = [];
+    for (const [cat, keywords] of Object.entries(KEYWORD_TO_CATEGORY)) {
+      if (keywords.some(k => kw.includes(k) || k.includes(kw))) {
+        matchedCategories.push(cat);
+      }
+    }
+
+    const files = [];
+    for (const cat of matchedCategories) {
+      // funny2 没有对应目录，回退到 funny
+      const catDir = path.join(LOCAL_STICKERS_DIR, cat);
+      if (!fs.existsSync(catDir)) {
+        // 尝试去掉数字后缀 (funny2→funny)
+        const baseCat = cat.replace(/\d+$/, "");
+        const altDir = path.join(LOCAL_STICKERS_DIR, baseCat);
+        if (altDir !== catDir && fs.existsSync(altDir)) {
+          const catFiles = fs.readdirSync(altDir)
+            .filter(f => /\.(gif|png|jpg|jpeg|webp)$/i.test(f))
+            .map(f => ({
+              file: path.join(altDir, f),
+              filename: f,
+              fromFile: true,
+              fromLocal: true,
+            }));
+          files.push(...catFiles);
+        }
+        continue;
+      }
+      const catFiles = fs.readdirSync(catDir)
+        .filter(f => /\.(gif|png|jpg|jpeg|webp)$/i.test(f))
+        .map(f => ({
+          file: path.join(catDir, f),
+          filename: f,
+          fromFile: true,
+          fromLocal: true,
+        }));
+      files.push(...catFiles);
+    }
+
+    // 当分类匹配结果不足时，从 general/ 补充（避免死数据）
+    const generalDir = path.join(LOCAL_STICKERS_DIR, "general");
+    if (files.length < 5 && fs.existsSync(generalDir)) {
+      const generalFiles = fs.readdirSync(generalDir)
+        .filter(f => /\.(gif|png|jpg|jpeg|webp)$/i.test(f))
+        .map(f => ({
+          file: path.join(generalDir, f),
+          filename: f,
+          fromFile: true,
+          fromLocal: true,
+          fromGeneral: true,
+        }));
+      files.push(...generalFiles);
+    }
+
+    if (files.length > 0) {
+      files.sort(() => Math.random() - 0.5);
+      console.log(`[sticker] 本地"${keyword}"→${matchedCategories.join(",") || "general"}→${files.length}张`);
+    }
+    return files.slice(0, 5);
   }
 
   /** 匹配用户表情包：关键词重叠即命中 */
@@ -196,112 +242,68 @@ export class StickerManager {
   }
 
   async _searchAllSources(keyword) {
-    // 1. API盒子 原词
-    let results = await this._searchApihz(keyword);
+    // 唯一在线源：发表情(fabiaoqing.com) — 免费、无水印、质量好
+    let results = await this._searchFabiaoqing(keyword);
     if (results.length >= 5) return results;
 
-    // 2. API盒子 + "表情包"
-    let results2 = await this._searchApihz(keyword + "表情包");
-    if (results2.length > 0) {
-      results.push(...results2);
-      if (results.length >= 5) return results;
-    }
-
-    // 3. API盒子 + "搞笑"（宽泛兜底）
-    if (results.length === 0) {
-      let results3 = await this._searchApihz(keyword + "搞笑");
-      if (results3.length > 0) results.push(...results3);
-    }
-
-    // 4. MemeMeow 最后兜底（减少数量，降低垃圾结果浪费的视觉API调用）
-    const meow = await this._searchMemeMeow(keyword, 5);
-    results.push(...meow);
+    // 首次不理想，加"表情包"后缀再试
+    const r2 = await this._searchFabiaoqing(keyword + "表情包");
+    results.push(...r2);
     return results;
   }
 
-  /** API盒子搜索 */
-  async _searchApihz(keyword) {
+  /** 发表情(fabiaoqing.com) — HTML解析提取图片URL，免费无水印 */
+  async _searchFabiaoqing(keyword) {
     try {
-      const id = "88888888";
-      const key = "88888888";
-      const apiUrl = `https://cn.apihz.cn/api/img/apihzbqb.php?id=${id}&key=${key}&type=2&words=${encodeURIComponent(keyword)}&limit=15`;
-      const data = await this._httpGet(apiUrl);
-      const result = JSON.parse(data);
+      // 直接请求最终页面，避免相对路径302重定向问题
+      const apiUrl = `https://www.fabiaoqing.com/search/bqb/keyword/${encodeURIComponent(keyword)}/type/bq/page/1.html`;
+      const html = await this._httpGet(apiUrl);
 
-      if (result.code !== 200 || !Array.isArray(result.res) || result.res.length === 0) {
-        console.log(`[sticker] API盒子"${keyword}"→0张`);
+      // 提取懒加载的 data-original 属性（img.soutula.com CDN）
+      const imgRegex = /data-original="(https:\/\/img\.soutula\.com\/[^"]+)"/g;
+      const urls = [];
+      let m;
+      while ((m = imgRegex.exec(html)) !== null) {
+        // bmiddle → large 获取高清版
+        const url = m[1].replace(/\/bmiddle\//, "/large/");
+        if (!urls.includes(url)) urls.push(url);
+      }
+
+      if (urls.length === 0) {
+        console.log(`[sticker] 发表情"${keyword}"→0张`);
         return [];
       }
 
-      const urls = result.res;
       const rest = urls.filter(u => !u.endsWith(".gif"));
       const gifs = urls.filter(u => u.endsWith(".gif"));
       const shuffled = [...rest.sort(() => Math.random() - 0.5), ...gifs.sort(() => Math.random() - 0.5)];
 
       const list = shuffled.map(u => {
         const ext = u.match(/\.(gif|png|jpg|jpeg|webp)/i)?.[0] || ".jpg";
-        return { url: u, filename: `${keyword}_${Date.now()}${ext}` };
+        return { url: u, filename: `fbq_${Date.now()}${ext}` };
       });
 
-      console.log(`[sticker] API盒子"${keyword}"→${list.length}张 (GIF ${gifs.length})`);
+      console.log(`[sticker] 发表情"${keyword}"→${list.length}张 (GIF ${gifs.length})`);
       return list;
     } catch (e) {
-      console.warn(`[sticker] API盒子"${keyword}"失败:`, e.message);
+      console.warn(`[sticker] 发表情"${keyword}"失败:`, e.message);
       return [];
     }
   }
 
-  /** MemeMeow 自然语言表情包搜索，limit 控制数量减少浪费 */
-  async _searchMemeMeow(keyword, limit = 5) {
-    try {
-      const apiUrl = `https://api.zvv.quest/search?q=${encodeURIComponent(keyword)}&n=${limit}`;
-      const data = await this._httpGet(apiUrl);
-      const result = JSON.parse(data);
+  getCount() { return this._userStickers.length; }
 
-      if (result.code !== 200 || !Array.isArray(result.data) || result.data.length === 0) {
-        console.log(`[sticker] MemeMeow"${keyword}"→0张`);
-        return [];
-      }
-
-      const urls = result.data;
-      // 预过滤：排除非图片URL和已知垃圾域名，减少后续视觉API浪费
-      const BAD_DOMAINS = /(?:douyin\.com\/aweme|xiaohongshu\.com\/discovery|zhihu\.com\/question|weixin\.qq\.com\/cgi-bin)/;
-      const validUrls = urls.filter(u => {
-        if (BAD_DOMAINS.test(u)) return false;
-        // 必须有合理的图片扩展名或来自已知图床
-        if (!/\.(gif|png|jpg|jpeg|webp|bmp)(\?|$)/i.test(u) && !/i\.pximg|imgur|ibb\.co|picsum|unsplash/i.test(u)) return false;
-        if (u.length > 500) return false; // 超长URL通常是追踪重定向
-        return true;
-      });
-      if (validUrls.length === 0) {
-        console.log(`[sticker] MemeMeow"${keyword}"→0张 (全部被预过滤)`);
-        return [];
-      }
-      const rest = validUrls.filter(u => !u.endsWith(".gif"));
-      const gifs = validUrls.filter(u => u.endsWith(".gif"));
-      const shuffled = [...rest.sort(() => Math.random() - 0.5), ...gifs.sort(() => Math.random() - 0.5)];
-      const skipped = urls.length - validUrls.length;
-      const list = shuffled.map(u => {
-        const ext = u.match(/\.(gif|png|jpg|jpeg|webp)/i)?.[0] || ".jpg";
-        return { url: u, filename: `${keyword}_${Date.now()}${ext}` };
-      });
-
-      console.log(`[sticker] MemeMeow"${keyword}"→${list.length}张${skipped > 0 ? ` (预过滤${skipped}张)` : ""} (GIF ${gifs.length})`);
-      return list;
-    } catch (e) {
-      console.warn(`[sticker] MemeMeow"${keyword}"失败:`, e.message);
-      return [];
-    }
-  }
-
-  random() { return "[捂脸]"; }
-  getCount() { return this._cacheSize() + this._userStickers.length; }
-
-  _httpGet(url) {
+  _httpGet(url, baseHost = "") {
     return new Promise((resolve, reject) => {
       https.get(url, { timeout: 8000, headers: { "User-Agent": "Mozilla/5.0" } }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          resolve(this._httpGet(res.headers.location));
+          let redirectUrl = res.headers.location;
+          // 处理相对路径重定向
+          if (redirectUrl.startsWith("/")) {
+            const u = new URL(url);
+            redirectUrl = `${u.protocol}//${u.host}${redirectUrl}`;
+          }
+          resolve(this._httpGet(redirectUrl, baseHost));
           return;
         }
         let body = "";

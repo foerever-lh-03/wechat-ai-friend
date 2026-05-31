@@ -104,7 +104,7 @@ export const TOOL_DEFINITIONS = [
     type: "function",
     function: {
       name: "generate_image",
-      description: "当对方想看某样东西的照片/图片/样子时，生成一张AI图片发给对方。比如对方说'看看你的猫''发张图看看''长什么样''有照片吗'，你就调用这个工具生成对应的图片。用中文描述要生成的画面，越具体越好。",
+      description: "当对方想看某样东西的照片/图片/样子时，生成一张AI图片发给对方。比如对方说'看看你的猫''发张照片看看''长什么样''有照片吗'，你就调用这个工具生成对应的图片。注意：如果对方要的是表情包/贴图/emoji/sticker，不要用这个工具，应该直接用📎标记发对应关键词的表情包。用中文描述要生成的画面，越具体越好。",
       parameters: {
         type: "object",
         properties: {
@@ -135,16 +135,23 @@ export function _setGeneratedImage(urlOrPath) {
   lastImageUrl = urlOrPath;
 }
 
-export async function executeTool(name, args, chatEngine) {
+export async function executeTool(name, args, chatEngine, sceneContext) {
   if (name === "web_search") return await webSearch(args.query);
   if (name === "generate_image") {
     if (!chatEngine) return "图片生成功能暂不可用";
     try {
-      // 注入宠物外观事实，确保每次生成的图片外观一致
       let imagePrompt = args.prompt;
+
+      // 注入当前场景上下文，让模型智能判断画面中应该/不应该包含什么
+      if (sceneContext) {
+        imagePrompt = `【当前真实场景】${sceneContext}\n【画面描述】${imagePrompt}\n请综合以上信息，生成与当前场景一致的画面。`;
+        console.log(`[tools] 注入场景上下文到图片prompt`);
+      }
+
+      // 注入宠物外观事实，确保每次生成的图片外观一致
       const petFacts = buildImageFacts();
       if (petFacts && (imagePrompt.includes("猫") || imagePrompt.includes("咪咪") || imagePrompt.includes("宠物"))) {
-        imagePrompt = `${imagePrompt}。注意：必须严格按以下外观生成：${petFacts}`;
+        imagePrompt = `${imagePrompt}。注意：画面中的猫必须严格按以下外观生成：${petFacts}`;
         console.log(`[tools] 注入宠物事实到图片prompt`);
       }
       const url = await chatEngine.generateImage(imagePrompt);
@@ -152,9 +159,9 @@ export async function executeTool(name, args, chatEngine) {
         lastImageUrl = url;
         return `图片已生成，请在回复中自然地提及这幅图（但不要重复图片描述），用户会在你的消息之后看到这幅图。`;
       }
-      return "图片生成失败，用文字简单描述一下对方想看的东西吧";
+      return "【图片生成失败】用自然的人话搪塞过去，比如'刚想拍结果它跑了''手机没电了拍不了''这会儿光线不好拍出来糊的'之类的生活化理由。不要提技术原因，不要用'无法生成''生成失败'之类的话。";
     } catch (e) {
-      return `图片生成失败: ${e.message}`;
+      return `【图片生成失败】用自然的人话搪塞过去，比如'刚想拍结果它跑了''手机没电了拍不了''这会儿光线不好拍出来糊的'之类的生活化理由。不要提技术原因，不要用'无法生成''生成失败'之类的话。`;
     }
   }
   return null;

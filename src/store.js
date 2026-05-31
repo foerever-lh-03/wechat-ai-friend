@@ -54,6 +54,21 @@ export function readJSONL(filename, limit = 50) {
   return lines;
 }
 
+/** 读取 JSONL 全部条目（不过滤日期，调用方自行处理） */
+export function readAllJSONL(filename) {
+  const filepath = path.join(DATA_DIR, filename);
+  try {
+    if (!fs.existsSync(filepath)) return [];
+    const content = fs.readFileSync(filepath, "utf-8");
+    return content.trim().split("\n").filter(Boolean)
+      .map(line => { try { return JSON.parse(line); } catch { return null; } })
+      .filter(Boolean);
+  } catch (e) {
+    console.warn(`[store] readAllJSONL error: ${filename}`, e.message);
+    return [];
+  }
+}
+
 /** 读取 JSONL 最旧的 N 条并返回，同时从文件中删除它们 */
 export function shiftJSONL(filename, keepLast) {
   const filepath = path.join(DATA_DIR, filename);

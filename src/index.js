@@ -1,8 +1,32 @@
+import { createRequire } from "node:module";
 import { createBot } from "./bot.js";
 import { config } from "../config/index.js";
 import { loadPersona, listPersonas } from "./persona.js";
 
 let botInstance = null;
+
+// Monkey-patch wechat4u assert.equal — 微信 API 在 session 预热期返回 1205
+// wechat4u 将其视为 fatal 并无限重试，导致 bot 永远卡在初始化
+// 这里将 1205 降级为 warn，让同步继续进行
+function patchWechat4u() {
+  try {
+    const req = createRequire(import.meta.url);
+    const globalMod = req.resolve("wechat4u/lib/util/global.js");
+    const mod = req(globalMod);
+    const origEqual = mod.assert.equal;
+    mod.assert.equal = function (actual, expected, response) {
+      if (actual === 1205 && expected === 0) {
+        console.warn("[patch] wechat4u assert.equal(1205, 0) 降级为 warn，跳过");
+        return;
+      }
+      return origEqual.call(this, actual, expected, response);
+    };
+    console.log("[patch] wechat4u assert.equal 已热修复");
+  } catch (e) {
+    console.warn("[patch] wechat4u 热修复失败:", e.message);
+  }
+}
+patchWechat4u();
 
 async function main() {
   console.log("====================================");

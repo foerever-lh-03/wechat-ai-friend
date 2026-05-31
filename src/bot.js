@@ -11,10 +11,77 @@ import { StickerManager } from "./sticker.js";
 import { EmotionTracker } from "./emotion.js";
 import { ReminderManager } from "./reminder.js";
 import { consumeGeneratedImage, peekGeneratedImage, _setGeneratedImage } from "./tools.js";
+import { SelfStateTracker } from "./self-state.js";
+import { readJSONL } from "./store.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CONTACTED_FILE = path.resolve(__dirname, "..", "data", "contacted.json");
+
+/** 持久化 contactedFriends 到磁盘，handleMessage 和 createBot 都需调用 */
+function saveContactedFriends(map) {
+  const data = [];
+  for (const [id, info] of map) {
+    data.push({ id, name: info.name });
+  }
+  try { fs.writeFileSync(CONTACTED_FILE, JSON.stringify(data), "utf-8"); } catch {}
+}
+
+// 记录最近发过的图片描述 → 下次回复时注入上下文，避免模型乱编
+const recentImagePrompt = new Map();
 
 /**
  * 解析收到的消息，将 emoji/表情包 XML 转为可读文字
  */
+// 模型可能发明的 emoji 名 → 微信真实 emoji 名（发前修复）
+const EMOJI_ALIAS = {
+  doge: "旺柴", 狗头: "旺柴",  dog: "旺柴",
+  笑哭: "捂脸", 笑cry: "捂脸", 笑死: "捂脸",
+  白眼: "白眼", 翻白眼: "白眼",
+  吃瓜群众: "吃瓜", 围观: "吃瓜",
+  破涕为笑: "捂脸", 破涕: "捂脸",
+  裂开了: "裂开", 裂开: "裂开",
+  苦涩: "委屈", 苦: "委屈",
+  保佑: "合十", 祈祷: "合十",
+};
+
+function fixEmojiAliases(text) {
+  return text.replace(/\[([^\]]+)\]/g, (match, name) => {
+    const fixed = EMOJI_ALIAS[name];
+    return fixed ? `[${fixed}]` : match;
+  });
+}
+
+// 模型输出的 emoji → 📎表情包关键词（除纯确认用的4个外，其余全部转贴图）
+const EMOJI_TO_STICKER = {
+  嘿哈: "好笑", 呲牙: "好笑", 偷笑: "好笑", 憨笑: "好笑", 愉快: "好笑", 机智: "好笑",
+  坏笑: "好笑", 吐: "好笑", 调皮: "好笑", 抠鼻: "好笑", 阴险: "好笑",
+  捂脸: "无语", 裂开: "无语", 擦汗: "无语", 尴尬: "无语", 流汗: "无语",
+  发怒: "生气", 鄙视: "生气", 敲打: "生气", 抓狂: "生气", 菜刀: "生气", 白眼: "生气",
+  旺柴: "吃瓜", 惊讶: "吃瓜", 发呆: "吃瓜", 吓: "吃瓜", 惊恐: "吃瓜",
+  流泪: "哭", 大哭: "哭", 委屈: "哭", 快哭了: "哭", 可怜: "哭", 凋谢: "哭",
+  爱心: "爱心", 亲亲: "爱心", 拥抱: "爱心", 玫瑰: "爱心", 色: "爱心",
+  强: "赞", 鼓掌: "赞", 奋斗: "赞", 加油: "赞", 耶: "赞", 转圈: "赞", 跳跳: "赞",
+  困: "睡觉", 睡: "睡觉", 哈欠: "睡觉", 月亮: "睡觉",
+  微笑: "好笑", 吃瓜: "吃瓜",
+};
+
+function convertEmojiToSticker(text) {
+  return text.replace(/\[([^\]]+)\]/g, (match, name) => {
+    // 纯确认用的4个保留，其余转📎
+    if (name === "OK" || name === "好的" || name === "握手" || name === "抱拳") {
+      return match;
+    }
+    const kw = EMOJI_TO_STICKER[name];
+    if (kw) {
+      console.log(`[emoji-convert] [${name}] → 📎${kw}`);
+      return `📎${kw}`;
+    }
+    // 未知 emoji → 去掉（可能是模型幻觉）
+    console.log(`[emoji-convert] 未知emoji [${name}] 已移除`);
+    return "";
+  });
+}
+
 function parseIncoming(msg) {
   const msgType = msg.type();
   const rawText = msg.text() || "";
@@ -22,6 +89,14 @@ function parseIncoming(msg) {
   // 表情包 vs 图片 分开标记，避免模型把表情包当成截图/视频
   if (msgType === types.Message.Emoticon) return "[发了一个表情包]";
   if (msgType === types.Message.Image) return "[收到一张图片]";
+
+  // 撤回消息：剔除 XML，只留标记。对方撤回通常是想重发，别追问
+  if (rawText.includes("<sysmsg") && rawText.includes("revokemsg")) {
+    let cleaned = rawText.replace(/<sysmsg\s[^>]*type\s*=\s*["']?revokemsg["']?[\s\S]*?<\/sysmsg>/gi, "");
+    cleaned = cleaned.replace(/<[^>]+>/g, "").trim();
+    if (!cleaned) return "[对方撤回了一条消息]";
+    return `${cleaned}；[对方撤回了一条消息]`;
+  }
 
   // 文本消息中可能夹杂 emoji XML，清洗并提取
   if (rawText.includes("<emoji") || rawText.includes("emoji emoji")) {
@@ -44,6 +119,22 @@ function parseIncoming(msg) {
     return cleaned || rawText;
   }
 
+  // 引用/回复消息：提取被引用原文，让 bot 理解对方在回复什么
+  // WeChat 引用格式: <appmsg ...><type>57</type><des>被引用的内容</des>...</appmsg>
+  if (rawText.includes("<appmsg") && rawText.includes("<type>57</type>")) {
+    const desMatch = rawText.match(/<des>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)<\/des>/i)
+                  || rawText.match(/<des>([\s\S]*?)<\/des>/i);
+    const quoted = desMatch ? desMatch[1].replace(/<[^>]+>/g, "").trim() : "";
+    // 去除整个 appmsg XML 块，保留回复文字
+    let replyText = rawText.replace(/<appmsg[\s\S]*?<\/appmsg>/gi, "").replace(/<[^>]+>/g, "").trim();
+    if (quoted) {
+      return replyText
+        ? `[对方引用了你的消息: "${quoted}"] 然后说: ${replyText}`
+        : `[对方引用了你的消息: "${quoted}"]`;
+    }
+    return replyText || rawText.replace(/<[^>]+>/g, "").trim();
+  }
+
   return rawText;
 }
 
@@ -55,6 +146,7 @@ export async function createBot() {
   const stickerMgr = new StickerManager();
   const emotionTracker = new EmotionTracker();
   const reminderMgr = new ReminderManager();
+  const selfState = new SelfStateTracker();
 
   const bot = WechatyBuilder.build({
     name: "wechat-ai-friend",
@@ -71,10 +163,59 @@ export async function createBot() {
   // 已聊过的好友集合（用于主动消息选人）
   const contactedFriends = new Map(); // friendId -> { name, target }
 
-  bot.on("login", (user) => {
+  bot.on("login", async (user) => {
     console.log(`\n[login] 已登录: ${user.name()} (${user.id})\n`);
+
+    // 等待 3 秒让 WeChat puppet 同步联系人数据，避免 bot.Contact.find() 全返回 null
+    await new Promise(r => setTimeout(r, 3000));
+
+    // 从历史恢复已聊过的好友（重启后 contactedFriends 为空导致主动消息无法选人）
+    try {
+      let restored = 0;
+      // 方式1：从 contacted.json 恢复（按 ID 查找，最可靠）
+      if (fs.existsSync(CONTACTED_FILE)) {
+        const list = JSON.parse(fs.readFileSync(CONTACTED_FILE, "utf-8"));
+        for (const { id, name } of list) {
+          try {
+            const contact = await bot.Contact.find({ id });
+            if (contact) { contactedFriends.set(id, { name, target: contact }); restored++; }
+          } catch { /* contact may not be available yet */ }
+        }
+      }
+      // 方式2：兜底 — 扫描 data/*.jsonl，用 findAll 匹配名称
+      if (contactedFriends.size === 0) {
+        const dataDir = path.resolve(__dirname, "..", "data");
+        const jsonlNames = new Set(
+          fs.readdirSync(dataDir).filter(f => f.endsWith(".jsonl") && !f.includes("self_state")).map(f => f.replace(".jsonl", ""))
+        );
+        if (jsonlNames.size > 0) {
+          try {
+            const allContacts = await bot.Contact.findAll();
+            for (const contact of allContacts) {
+              const id = contact.id || "";
+              if (id.startsWith("gh_")) continue;
+              // 过滤公众号/系统账号
+              try { if (contact.type() === types.Contact.Official) continue; } catch {}
+              const name = contact.name();
+              if (name === "微信团队" || name === "weixin") continue;
+              if (jsonlNames.has(name)) {
+                contactedFriends.set(id, { name, target: contact });
+                restored++;
+              }
+            }
+          } catch { console.log("[restore] Contact.findAll 不可用，等待主动聊天"); }
+        }
+      }
+      if (contactedFriends.size > 0) {
+        saveContactedFriends(contactedFriends);
+        const names = [...contactedFriends.values()].map(v => v.name).join(", ");
+        console.log(`[restore] 已恢复 ${contactedFriends.size} 个好友: ${names}`);
+      } else {
+        console.log("[restore] 暂无历史好友，等待首次聊天后自动记录");
+      }
+    } catch (e) { console.warn("[restore] 恢复好友失败:", e.message); }
     // 启动主动聊天定时器
-    startProactiveScheduler(bot, persona, chatEngine, memory, stickerMgr, contactedFriends);
+    startProactiveScheduler(bot, persona, chatEngine, memory, stickerMgr, contactedFriends, selfState);
     // 心跳日志（每5分钟，确认 bot 存活）
     setInterval(() => {
       const now = new Date();
@@ -97,6 +238,9 @@ export async function createBot() {
         }
       }
     }, 30000);
+
+    // 每日总结调度器（23:55 执行）
+    scheduleDailySummary(memory, contactedFriends);
   });
 
   bot.on("logout", (user) => {
@@ -110,7 +254,7 @@ export async function createBot() {
 
   bot.on("message", async (msg) => {
     try {
-      await handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, contactedFriends);
+      await handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState, contactedFriends);
     } catch (e) {
       console.error("[message handler error]", e.message);
     }
@@ -119,58 +263,96 @@ export async function createBot() {
   return { bot, persona, chatEngine, memory, stickerMgr, emotionTracker };
 }
 
-async function handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, contactedFriends) {
+async function handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState, contactedFriends) {
   if (msg.self()) return;
 
   const talker = msg.talker();
+  // 过滤公众号/服务号：types.Contact.Official 不一定覆盖所有情况
   if (talker.type() === types.Contact.Official) return;
+  try {
+    const wid = talker.payload?.weixin || talker.id || "";
+    if (wid.startsWith("gh_")) return; // 公众号 ID
+  } catch {}
   const room = msg.room();
   let text = parseIncoming(msg);
 
   // 图片消息：尝试下载图片用于视觉识别
   const msgType = msg.type();
   if (msgType === types.Message.Image || msgType === types.Message.Attachment || msgType === types.Message.Emoticon) {
-    console.log(`[image] ${talker.name()}: 收到${msgType === types.Message.Emoticon ? "表情包" : "图片"}，尝试下载...`);
+    const isEmoticon = msgType === types.Message.Emoticon;
+    console.log(`[image] ${talker.name()}: 收到${isEmoticon ? "表情包" : "图片"}，尝试下载...`);
     let imageBase64 = null;
     let imageBuffer = null;
     let imageMime = "image/jpeg";
+    let downloaded = false;
+
+    // 策略1: 标准路径 toFileBox → puppet.messageFile
     try {
-      // web 协议下 payload 可能为空，先检查
-      if (!msg || !msg.toFileBox) {
-        console.log(`[image] ⚠️ 不支持下载 (web协议限制，此消息类型无法获取文件)`);
-        imageBase64 = null; // 跳过
+      const fileBox = await msg.toFileBox();
+      const buffer = await fileBox.toBuffer();
+      if (buffer.length > 0) {
+        imageBuffer = buffer;
+        imageBase64 = buffer.toString("base64");
+        imageMime = fileBox.mediaType || imageMime;
+        console.log(`[image] ✅ 下载成功! 大小: ${buffer.length} bytes, 类型: ${imageMime}`);
+        downloaded = true;
       } else {
-        const fileBox = await msg.toFileBox();
-        const buffer = await fileBox.toBuffer();
-        if (buffer.length > 0) {
-          imageBuffer = buffer;
-          imageBase64 = buffer.toString("base64");
-          imageMime = fileBox.mediaType || imageMime;
-          console.log(`[image] ✅ 下载成功! 大小: ${buffer.length} bytes, 类型: ${imageMime}`);
-        } else {
-          console.log(`[image] ⚠️ 下载为空 (web协议限制)`);
-        }
+        console.log(`[image] ⚠️ toFileBox 返回空数据`);
       }
     } catch (e) {
-      console.log(`[image] ⚠️ 下载失败 (web协议限制): ${e.message.substring(0, 80)}`);
+      console.log(`[image] ⚠️ toFileBox 失败: ${e.message.substring(0, 100)}`);
     }
 
-    // 用户表情包 → AI打标后缓存复用
+    // 策略2: Emoticon/Image 回退 — 绕过 puppet 的 FileBox 包装，直接调 wechat4u.getMsgImg()
+    // messageFile() 对 Emoticon 走 FileBox.fromUrl(cdnurl) 可能因防盗链失败
+    // messageImage() 内部 FileBox.fromStream 处理 arraybuffer 有兼容问题
+    // 所以直接拿 wechat4u 实例 → getMsgImg(MsgId) → FileBox.fromBuffer
+    if (!downloaded && bot.puppet && bot.puppet.wechat4u) {
+      try {
+        console.log(`[image] 尝试 getMsgImg 直接调用回退...`);
+        const result = await bot.puppet.wechat4u.getMsgImg(msg.id);
+        if (result && result.data && result.data.length > 0) {
+          const { FileBox } = await import("file-box");
+          const fileBox = FileBox.fromBuffer(result.data, `msg_${msg.id}.jpg`);
+          const buffer = await fileBox.toBuffer();
+          if (buffer.length > 0) {
+            imageBuffer = buffer;
+            imageBase64 = buffer.toString("base64");
+            imageMime = result.type || fileBox.mediaType || "image/jpeg";
+            console.log(`[image] ✅ getMsgImg 直调成功! 大小: ${buffer.length} bytes, 类型: ${imageMime}`);
+            downloaded = true;
+          }
+        } else {
+          console.log(`[image] ⚠️ getMsgImg 返回空数据`);
+        }
+      } catch (e2) {
+        console.log(`[image] ⚠️ getMsgImg 直调失败: ${e2.message.substring(0, 100)}`);
+      }
+    }
+
+    // 用户表情包 → AI打标后缓存复用（MD5去重）
     if (imageBase64 && msgType === types.Message.Emoticon && chatEngine.tagSticker) {
       try {
         const crypto = await import("node:crypto");
-        const hash = crypto.createHash("md5").update(imageBuffer).digest("hex").substring(0, 8);
-        const ext = imageMime.includes("gif") ? "gif" : "jpg";
-        const stickerDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data", "stickers");
-        fs.mkdirSync(stickerDir, { recursive: true });
-        const stickerPath = path.join(stickerDir, `user_${Date.now()}_${hash}.${ext}`);
-        fs.writeFileSync(stickerPath, imageBuffer);
-        const tags = await chatEngine.tagSticker(imageBase64, ext === "gif" ? "image/gif" : "image/jpeg");
-        if (tags && tags.keywords && tags.keywords.length > 0) {
-          stickerMgr.addUserSticker(stickerPath, tags.keywords);
+        const fullMd5 = crypto.createHash("md5").update(imageBuffer).digest("hex");
+        const shortHash = fullMd5.substring(0, 8);
+
+        // 内容去重：相同MD5不再重复保存
+        if (stickerMgr.hasStickerByMD5(fullMd5)) {
+          console.log(`[sticker] 重复表情包跳过 (MD5: ${shortHash})`);
         } else {
-          // 打标失败，删除文件
-          try { fs.unlinkSync(stickerPath); } catch {}
+          const ext = imageMime.includes("gif") ? "gif" : "jpg";
+          const stickerDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data", "stickers");
+          fs.mkdirSync(stickerDir, { recursive: true });
+          const stickerPath = path.join(stickerDir, `user_${Date.now()}_${shortHash}.${ext}`);
+          fs.writeFileSync(stickerPath, imageBuffer);
+          const tags = await chatEngine.tagSticker(imageBase64, ext === "gif" ? "image/gif" : "image/jpeg");
+          if (tags && tags.keywords && tags.keywords.length > 0) {
+            stickerMgr.addUserSticker(stickerPath, tags.keywords, fullMd5);
+          } else {
+            // 打标失败，删除文件
+            try { fs.unlinkSync(stickerPath); } catch {}
+          }
         }
       } catch (e) {
         console.log(`[sticker-cache] 用户表情包缓存失败: ${e.message.substring(0, 80)}`);
@@ -201,9 +383,18 @@ async function handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, 
   const friendName = talker.name();
   const friendId = talker.id;
 
-  // 记录好友（用于主动消息）
-  if (!room && friendId) {
-    contactedFriends.set(friendId, { name: friendName, target: talker });
+  // 记录好友（用于主动消息）—— 排除公众号
+  if (!room && friendId && talker.type() !== types.Contact.Official) {
+    try {
+      const wid = talker.payload?.weixin || friendId || "";
+      if (!wid.startsWith("gh_")) {
+        contactedFriends.set(friendId, { name: friendName, target: talker });
+        saveContactedFriends(contactedFriends);
+      }
+    } catch {
+      contactedFriends.set(friendId, { name: friendName, target: talker });
+      saveContactedFriends(contactedFriends);
+    }
   }
 
   if (room) {
@@ -213,7 +404,7 @@ async function handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, 
     }
     // 群聊每条都回（不限@）
     if (!text) return;
-    await processAndReply(bot, room, roomName, text, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr);
+    await processAndReply(bot, room, roomName, text, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState);
     return;
   }
 
@@ -236,7 +427,7 @@ async function handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, 
     console.log(`[cooldown] ${friendName}: 冷却缓冲 (${cb.texts.length}条)`);
     if (cb.timer) clearTimeout(cb.timer);
     cb.timer = setTimeout(() => {
-      flushCooldown(friendName, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr);
+      flushCooldown(friendName, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState);
     }, COOLDOWN_MS);
     return;
   }
@@ -261,7 +452,7 @@ async function handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, 
   pendingTimers.set(friendName, setTimeout(() => {
     console.log(`[debounce] ${friendName}: 定时器触发，准备flush`);
     try {
-      flushDebounced(friendName, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr);
+      flushDebounced(friendName, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState);
     } catch (e) {
       console.error(`[debounce] ${friendName}: flush异常:`, e.message, e.stack);
     }
@@ -272,11 +463,11 @@ async function handleMessage(msg, bot, persona, chatEngine, memory, stickerMgr, 
 /**
  * 主动聊天调度器：每隔一段时间随机决定是否主动找好友聊天
  */
-// 主动聊天话题池
+// 主动聊天话题池（不含"好久没联系"类死板话题——由时间间隔上下文自然驱动）
 const PROACTIVE_TOPICS = [
   "（你突然想找朋友聊聊天，分享你今天遇到的一件小事。直接说内容，不要铺垫。）",
   "（你刷手机看到一个好笑的，想分享给朋友。说具体的趣事。）",
-  "（你觉得好久没联系了，问问对方近况。随意一点，别太正式。）",
+  "（你刚忙完一阵，想找人聊两句。轻松随意，别太正式。）",
   "（你刚下班/吃完饭，无聊想找人聊两句。抛个轻松的话题。）",
   "（你的猫刚做了个搞笑的事，想跟朋友分享一下。）",
   "（你突然想起之前聊过的某个话题，接着问一句。显得你一直惦记着。）",
@@ -291,21 +482,26 @@ const busyTargets = new Map(); // targetName -> string[] 缓冲消息
 // 追踪每个好友最近的消息分类，用于检测"收尾"模式
 const lastMsgType = new Map(); // targetName -> { type, count }
 
-/** 将模型回复转为发送段：优先""拆分，无""时按句子边界拆分。发送时保真，不做机械合并 */
+/** 将模型回复转为发送段：按语义边界拆分，多策略 fallback */
 function splitReply(reply) {
-  let segments = reply.split(/""/).filter(s => s.trim());
+  // 统一换行为 \n（处理 Windows \r\n）
+  const normalized = reply.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
-  // 模型没用""分条 → 按句子边界拆分
+  // 策略1: 空行分隔（模型用段落表达语义转折，最自然）
+  let segments = normalized.split(/\n{2,}/).filter(s => s.trim());
+
+  // 策略2: "" 显式分隔（兼容旧格式）
+  if (segments.length <= 1) {
+    segments = reply.split(/""/).filter(s => s.trim());
+  }
+
+  // 策略3: 句子边界拆分
   if (segments.length <= 1) {
     const text = segments[0] || reply;
-    // 1. 先在句号/感叹号/问号处切开
     let raw = text.split(/(?<=[。！？])/).filter(s => s.trim());
-    // 2. 如果只有1段且超过18字，在逗号处再切
     if (raw.length === 1 && raw[0].length > 18) {
-      // 按逗号切分，但不保留逗号在末尾
       const parts = raw[0].split(/，/).filter(s => s.trim());
       if (parts.length >= 2) {
-        // 合并过短的首段
         if (parts[0].length <= 4 && parts.length >= 3) {
           parts[1] = parts[0] + "，" + parts[1];
           parts.shift();
@@ -421,17 +617,24 @@ async function sendStickerForKeyword(target, keyword, stickerMgr, chatEngine, em
   const candidates = await stickerMgr.searchOnline(kw);
   if (candidates.length > 0) {
     let sent = false;
-    for (let i = 0; i < Math.min(candidates.length, 5); i++) {
-      const ok = await stickerTextMatch(candidates[i], kw, chatEngine, replyContext);
+    // 优先尝试本地文件/用户表情包（免视觉检查），然后尝试缓存/在线（需视觉检查）
+    const sorted = [
+      ...candidates.filter(c => c.fromFile),
+      ...candidates.filter(c => !c.fromFile),
+    ];
+    for (let i = 0; i < Math.min(sorted.length, 3); i++) {
+      const c = sorted[i];
+      // 本地文件/用户表情包免检；缓存和在线URL需要视觉验证
+      const needCheck = !c.fromFile;
+      const ok = needCheck ? await stickerTextMatch(c, kw, chatEngine, replyContext) : true;
       if (ok) {
         try {
-          if (candidates[i].fromFile) {
-            await target.say(FileBox.fromFile(candidates[i].file, candidates[i].filename));
-            console.log(`[sticker-sent] ${keyword} → 用户表情包`);
+          if (c.fromFile) {
+            await target.say(FileBox.fromFile(c.file, c.filename));
+            console.log(`[sticker-sent] ${keyword} → ${c.fromUser ? "用户表情包" : "本地文件"} ${c.filename}`);
           } else {
-            await target.say(FileBox.fromUrl(candidates[i].url, candidates[i].filename));
-            console.log(`[sticker-sent] ${keyword} → 第${i + 1}/${candidates.length}张`);
-            stickerMgr.addToCache(kw, candidates[i].url);
+            await target.say(FileBox.fromUrl(c.url, c.filename));
+            console.log(`[sticker-sent] ${keyword} → 第${i + 1}/${sorted.length}张`);
           }
           sent = true;
         } catch (e) { /* try next */ }
@@ -451,17 +654,17 @@ async function sendStickerForKeyword(target, keyword, stickerMgr, chatEngine, em
         console.log(`[sticker-fallback] "${kw}" → 后备"${fbk}"`);
         const fbc = await stickerMgr.searchOnline(fbk);
         if (fbc.length > 0) {
-          for (let i = 0; i < Math.min(fbc.length, 3); i++) {
-            const ok = await stickerTextMatch(fbc[i], fbk, chatEngine, replyContext);
+          for (let i = 0; i < Math.min(fbc.length, 2); i++) {
+            const needCheck = !fbc[i].fromFile;
+            const ok = needCheck ? await stickerTextMatch(fbc[i], fbk, chatEngine, replyContext) : true;
             if (ok) {
               try {
                 if (fbc[i].fromFile) {
                   await target.say(FileBox.fromFile(fbc[i].file, fbc[i].filename));
-                  console.log(`[sticker-sent] 后备"${fbk}" → 用户表情包`);
+                  console.log(`[sticker-sent] 后备"${fbk}" → ${fbc[i].fromUser ? "用户" : "本地"} ${fbc[i].filename}`);
                 } else {
                   await target.say(FileBox.fromUrl(fbc[i].url, fbc[i].filename));
                   console.log(`[sticker-sent] 后备"${fbk}" → 第${i + 1}张`);
-                  stickerMgr.addToCache(fbk, fbc[i].url);
                 }
                 fallbackSent = true;
               } catch (e) { /* continue */ }
@@ -473,14 +676,14 @@ async function sendStickerForKeyword(target, keyword, stickerMgr, chatEngine, em
       }
       if (!fallbackSent) {
         const emoji = emotionCtx ? contextEmoji(emotionCtx.emotion) : stickerMgr.search(kw);
-        console.log(`[sticker-blocked] ${keyword}: 主+后备均未通过 → emoji ${emoji}`);
+        console.log(`[sticker-blocked] ${keyword}: 全部未通过/无本地 → emoji ${emoji}`);
         if (emoji) { await target.say(emoji); }
       }
     }
     return;
   }
 
-  // 无候选结果
+  // 无候选结果 → 直接 emoji
   const emoji = emotionCtx ? contextEmoji(emotionCtx.emotion) : stickerMgr.search(kw);
   console.log(`[sticker-noresult] ${keyword}: 搜索无结果 → emoji ${emoji}`);
   if (emoji) { await target.say(emoji); }
@@ -536,7 +739,7 @@ function normalizeKeyword(kw) {
     "爱": "爱心", "喜欢": "爱心", "甜": "爱心",
     "猫猫": "猫", "喵": "猫", "猫咪": "猫",
     "狗狗": "狗", "汪": "狗",
-    "吃瓜": "围观", "八卦": "围观",
+    "八卦": "围观",
     "裂开": "无语", "服了": "无语", "绝了": "无语",
     "比心": "爱心", "亲亲": "爱心",
   };
@@ -545,21 +748,19 @@ function normalizeKeyword(kw) {
 
 // 根据聊天氛围自动决定是否配表情包（不依赖模型手动输出📎）
 function decideSticker(emotion, classification, replyText) {
-  // 简短寒暄不加，知识类问题不加
-  if (classification === "simple" || classification === "complex") return null;
-  // 回复太短不加（1-2个字）
-  if (replyText.length <= 3) return null;
+  // 知识类问题不加表情包，其余场景都可以
+  if (classification === "complex") return null;
   // 已经有📎的不重复加
   if (/📎\S+/.test(replyText)) return null;
-  // 告别/结束/忙碌信号：不加表情包，简洁结束
-  if (/拜拜|bye|再见|睡了|忙了|开会|有事|先撤|下了|先忙/.test(replyText)) return null;
 
   const mood = (emotion && emotion.emotion) || "neutral";
+  const isShort = replyText.length <= 3;
+  const isFarewell = /拜拜|bye|再见|晚安|睡了|忙了|开会|有事|先撤|下了|先忙/.test(replyText);
+  const isAck = /^(ok|OK|Ok|okk|欧克|好的|好嘞|行|行吧|嗯嗯|嗯呢|嗯呐|好滴|好哒|好哦|得嘞|妥|成|中|阔以|可|哦哦|哦|好呀|行呀|对|是的|没错|收到|知道了|懂了|明白了|1|👌|👍)$/.test(replyText.trim());
 
-  // 情绪 → 候选关键词（带权重：出现次数越多概率越高）
-  // 注意：不用"狗"等可能被视觉模型误判出攻击性文字的类别
+  // 基础候选池
   const candidates = {
-    happy:    ["好笑", "好笑", "好笑", "赞", "爱心"],
+    happy:    ["好笑", "好笑", "赞", "爱心"],
     sad:      ["哭", "爱心", "爱心", "摸鱼"],
     angry:    ["无语", "生气"],
     surprised:["吃瓜", "好笑"],
@@ -567,19 +768,35 @@ function decideSticker(emotion, classification, replyText) {
     neutral:  ["好笑", "赞", "猫", "狗", "吃瓜", "好的"],
   };
 
-  const pool = candidates[mood] || candidates.neutral;
+  const pool = [...(candidates[mood] || candidates.neutral)];
 
-  // 倾诉发泄通道：更倾向共情类表情包
+  // 告别/晚安 → 偏好的/睡觉类
+  if (isFarewell) {
+    pool.push("好的", "好的", "睡觉", "睡觉");
+  }
+  // 简短确认 → 偏好的/OK
+  if (isAck || isShort) {
+    pool.push("好的", "好的", "赞", "赞");
+  }
+  // 倾诉发泄 → 共情类
   if (classification === "vent") {
     pool.push("爱心", "爱心", "哭");
   }
 
-  // 25% 概率决定加不加（neutral 最常见，降低频率避免不合时宜）
-  const chance = mood === "neutral" ? 0.22 : 0.30;
+  // 概率：告别/确认/短回复更高，因为表情包本身就是回复
+  let chance;
+  if (isFarewell || isAck) {
+    chance = 0.50; // 告别和确认一半概率用表情包代替文字
+  } else if (isShort) {
+    chance = 0.40;
+  } else {
+    chance = mood === "neutral" ? 0.25 : 0.30;
+  }
+
   if (Math.random() > chance) return null;
 
   const kw = pool[Math.floor(Math.random() * pool.length)];
-  console.log(`[sticker-auto] 氛围检测: mood=${mood} class=${classification} → 自动追加📎${kw}`);
+  console.log(`[sticker-auto] 氛围检测: mood=${mood} class=${classification}${isFarewell ? " farewell" : ""}${isAck ? " ack" : ""}${isShort ? " short" : ""} → 自动追加📎${kw}`);
   return kw;
 }
 
@@ -620,7 +837,7 @@ function classifyMessage(text) {
 
   // 情绪宣泄：长消息 + 强烈情绪词 → 需要共情而非搜索
   const ventPatterns = [
-    /气死[我了]?|崩溃[了]?|受不了[了]?|好烦|难过.*[了死了 crying]/,
+    /气死[我了]?|崩溃[了]?|受不了[了]?|好烦|难过(?:死了|哭了|crying|[了得])/,
     /想哭|焦虑|压力.*[大死]|好累|撑不住|扛不住|真的.*[难受烦累困倦绝望]/,
     /凭什么|为什么.*[我]|我.*太.*[难痛苦累]了|烦死[我了]?/,
     /(失恋|分手|被甩|吵架|闹掰|被裁|离职|裸辞|挂科|考砸)/,
@@ -635,6 +852,7 @@ function classifyMessage(text) {
   const complexPatterns = [
     /为什么|什么是|怎么(做|办|回事)|如何|什么时候|在哪里|是谁/,
     /查一下|搜一下|搜索|帮我查|知不知道|听说过吗/,
+    /(去|帮我|给我)?(了?解一下|了解下|了解|查查|搜搜)/,
     /介绍一下|科普|解释一下|最新|新闻|今天.*发生/,
     /推荐.*(电影|书|游戏|番|剧|音乐|歌|吃的|餐厅|手机|电脑|耳机|键盘)/,
     /有什么.*(好|推荐|新|好玩|好看|好吃)/,
@@ -678,7 +896,7 @@ const pendingTimers = new Map(); // targetName -> timeoutId
 const COOLDOWN_MS = 8000;
 const cooldownBuf = new Map(); // targetName -> { target, texts: [], timer }
 
-function flushCooldown(name, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr) {
+function flushCooldown(name, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState) {
   const buf = cooldownBuf.get(name);
   if (!buf || buf.texts.length === 0) return;
   cooldownBuf.delete(name);
@@ -697,19 +915,70 @@ function flushCooldown(name, bot, persona, chatEngine, memory, stickerMgr, emoti
     pendingBuffers.set(name, { target: buf.target, targetName: name, texts: [merged] });
   }
   pendingTimers.set(name, setTimeout(() => {
-    flushDebounced(name, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr);
+    flushDebounced(name, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState);
   }, DEBOUNCE_MS));
 }
 
-function startProactiveScheduler(bot, persona, chatEngine, memory, stickerMgr, contactedFriends) {
-  const intervalMin = 10; // 每 10-30 分钟检查一次
-  const intervalMax = 30;
+function scheduleDailySummary(memory, contactedFriends) {
+  // 计算到今晚 23:55 的毫秒数
+  const now = new Date();
+  const target = new Date(now);
+  target.setHours(23, 55, 0, 0);
+  if (target <= now) {
+    // 已经过了今天 23:55，等到明天
+    target.setDate(target.getDate() + 1);
+  }
+
+  const msUntilTarget = target.getTime() - now.getTime();
+  console.log(`[daily-summary] 每日总结已调度，首次 ${target.toLocaleString()} (${Math.round(msUntilTarget / 60000)}分钟后)`);
+
+  const runDailySummary = async () => {
+    const todayStr = new Date().toLocaleDateString("zh-CN");
+    console.log(`\n[daily-summary] ========== ${todayStr} 每日总结开始 ==========`);
+    const friends = [...contactedFriends.values()];
+    if (friends.length === 0) {
+      console.log("[daily-summary] 无联系好友，跳过");
+      return;
+    }
+    for (const friend of friends) {
+      try {
+        await memory.dailySummarize(friend.name);
+      } catch (e) {
+        console.error(`[daily-summary] ${friend.name} 失败:`, e.message);
+      }
+    }
+    console.log(`[daily-summary] ========== 完成 ==========\n`);
+  };
+
+  // 首次用 setTimeout，之后用 setInterval
+  setTimeout(() => {
+    runDailySummary();
+    setInterval(runDailySummary, 24 * 60 * 60 * 1000);
+  }, msUntilTarget);
+}
+
+// 主动聊天调度器状态（防重复启动）
+let proactiveState = null; // { active: true } | null
+
+function startProactiveScheduler(bot, persona, chatEngine, memory, stickerMgr, contactedFriends, selfState) {
+  // 取消旧调度链，用最新的 Map 重新开始
+  if (proactiveState) {
+    proactiveState.active = false;
+    console.log("[proactive] 取消旧调度链，重新启动");
+  }
+  const state = { active: true };
+  proactiveState = state;
+
+  const intervalMin = 8;
+  const intervalMax = 20;
 
   const scheduleNext = () => {
+    if (!state.active) return; // 旧链被取消
     const interval = (intervalMin + Math.random() * (intervalMax - intervalMin)) * 60 * 1000;
     setTimeout(async () => {
+      if (!state.active) return;
       try {
-        await proactiveTick(bot, persona, chatEngine, memory, stickerMgr, contactedFriends);
+        await proactiveTick(bot, persona, chatEngine, memory, stickerMgr, contactedFriends, selfState);
       } catch (e) {
         console.error("[proactive] 调度错误:", e.message);
       }
@@ -717,18 +986,19 @@ function startProactiveScheduler(bot, persona, chatEngine, memory, stickerMgr, c
     }, interval);
   };
 
-  console.log(`[proactive] 主动聊天已启动（每${intervalMin}-${intervalMax}分钟检查，概率${(config.proactiveChance * 100).toFixed(1)}%）`);
+  const chance = persona.behavior?.proactiveChance ?? config.proactiveChance ?? 0.02;
+  console.log(`[proactive] 主动聊天已启动（每${intervalMin}-${intervalMax}分钟检查，概率${(chance * 100).toFixed(1)}%）`);
   scheduleNext();
 }
 
-async function proactiveTick(bot, persona, chatEngine, memory, stickerMgr, contactedFriends) {
+async function proactiveTick(bot, persona, chatEngine, memory, stickerMgr, contactedFriends, selfState) {
   if (isQuietTime()) {
     console.log("[proactive] 免打扰时段，跳过");
     return;
   }
 
   // 随机判断
-  const chance = config.proactiveChance || 0.02;
+  const chance = persona.behavior?.proactiveChance ?? config.proactiveChance ?? 0.02;
   if (Math.random() > chance) {
     return;
   }
@@ -758,12 +1028,40 @@ async function proactiveTick(bot, persona, chatEngine, memory, stickerMgr, conta
   const fewShots2 = getFewShotMessages(persona);
   messages.splice(1, 0, ...fewShots2);
 
-  const topic = PROACTIVE_TOPICS[Math.floor(Math.random() * PROACTIVE_TOPICS.length)];
-  messages.push({ role: "user", content: topic });
+  // 计算距上次聊天的时间间隔，让模型自然判断该聊什么
+  let timeNote = "";
+  try {
+    const logEntries = readJSONL(`${friend.name}.jsonl`, 1);
+    if (logEntries.length > 0) {
+      const lastTime = new Date(logEntries[logEntries.length - 1].time);
+      if (!isNaN(lastTime)) {
+        const minutesAgo = Math.floor((Date.now() - lastTime.getTime()) / 60000);
+        if (minutesAgo < 30) {
+          timeNote = "\n（你们刚刚才聊过，别说好久没聊之类的话。顺便提一嘴刚聊的事。）";
+        } else if (minutesAgo > 300) {
+          timeNote = `\n（你们大概${Math.floor(minutesAgo / 60)}小时没聊了，自然地问候一下，别太刻意。）`;
+        } else if (minutesAgo > 120) {
+          timeNote = `\n（距离上次聊天过了${Math.floor(minutesAgo / 60)}小时，可以随口提一句。）`;
+        }
+      }
+    }
+  } catch {}
 
-  const reply = await chatEngine.chat(messages, {
+  const topic = PROACTIVE_TOPICS[Math.floor(Math.random() * PROACTIVE_TOPICS.length)];
+  messages.push({ role: "user", content: topic + timeNote });
+
+  // 当前状态注入：让模型知道自己在哪、什么时间
+  {
+    const stateShort = selfState.getContextShort();
+    if (stateShort) {
+      messages.push({ role: "system", content: stateShort });
+    }
+  }
+
+  let reply = await chatEngine.chat(messages, {
     temperature: persona.behavior?.temperature ?? 0.9,
     maxTokens: persona.behavior?.maxTokens ?? 400,
+    sceneContext: selfState.getContext(),
   });
 
   if (!reply) {
@@ -801,6 +1099,10 @@ async function proactiveTick(bot, persona, chatEngine, memory, stickerMgr, conta
     }
   }
 
+  // 修复emoji别名 + 转📎表情包（必须在发送前处理）
+  reply = fixEmojiAliases(reply);
+  reply = convertEmojiToSticker(reply);
+
   // 延迟后发送（主动消息也加点随机延迟）
   const delay = randomDelay(5, 20);
   console.log(`[proactive delay] ${delay / 1000}s`);
@@ -834,19 +1136,20 @@ async function proactiveTick(bot, persona, chatEngine, memory, stickerMgr, conta
   // 记录到记忆（剥离📎指令）
   const cleanReply = reply.replace(/📎\S+/g, "").trim();
   memory.saveExchange(friend.name, "[主动搭话]", cleanReply);
+  selfState.updateFromReply(cleanReply);
 }
 
-function flushDebounced(name, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr) {
+function flushDebounced(name, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState) {
   const buf = pendingBuffers.get(name);
   if (!buf || buf.texts.length === 0) return;
   pendingBuffers.delete(name);
   pendingTimers.delete(name);
   const merged = buf.texts.join("；");
   console.log(`[debounce] ${name}: 合并${buf.texts.length}条 → "${merged.substring(0, 40)}"`);
-  processAndReply(bot, buf.target, name, merged, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr);
+  processAndReply(bot, buf.target, name, merged, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState);
 }
 
-async function processAndReply(bot, target, targetName, text, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr) {
+async function processAndReply(bot, target, targetName, text, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState) {
   console.log(`[msg] ${targetName}: ${text.substring(0, 50)}`);
 
   if (isQuietTime()) {
@@ -887,12 +1190,14 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
     { style: emotionState.style, shouldAsk, trajectory: emotionalTrajectory }
   );
 
-  // 白天时间意识：21点前绝对不催休息
+  // 白天时间意识：18点前不催休息，18-21点不说晚安但可聊晚间话题
   {
     const now = new Date();
     const h = now.getHours();
-    if (h >= 6 && h < 21) {
-      systemPrompt += `\n\n【时间意识】现在是白天/傍晚，对方还要正常活动。绝对不能说"早点休息""晚安""快去睡""明天还要上班"之类的话，即使对方发了简短回复想结束对话，你也只能说"嗯嗯""好嘞""ok"这样自然的结束语，不要劝人去休息。`;
+    if (h >= 6 && h < 18) {
+      systemPrompt += `\n\n【时间意识】现在是白天，对方还要正常活动。绝对不能说"早点休息""晚安""快去睡""明天还要上班"之类的话。`;
+    } else if (h >= 18 && h < 21) {
+      systemPrompt += `\n\n【时间意识】现在是晚间。对方可能刚下班在休息。别催睡觉，但也别聊工作/上班的话题。`;
     }
   }
 
@@ -901,8 +1206,12 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
     systemPrompt += `\n\n【重要】对方让你在 ${reminderInfo.target.toLocaleString()} 提醒他："${reminderInfo.message}"。你在回复里自然地表示记住了，比如"好的明天7点叫你"这样。`;
   }
 
+  // 纯确认/收尾词：剥离表情包标记和分隔符后再判断
+  const ackCheckText = text.replace(/\[发了一个表情包\]|\[收到一张图片\]|\[对方撤回了一条消息\]/g, "").replace(/[；;，,]\s*/g, "").trim();
+  const isAckMsg = /^(ok|OK|Ok|okk|欧克|好的|好嘞|行|行吧|嗯嗯|嗯呢|嗯呐|好滴|好哒|好哦|得嘞|妥|成|中|阔以|可|哦哦|哦|好呀|行呀|对|是的|没错|收到|知道了|懂了|明白了|1|👌|👍)$/.test(ackCheckText);
+
   // 提前检测结束信号 + 消息分类，用于抑制话题回调
-  const isEnding = detectEndingSignal(text);
+  const isEnding = detectEndingSignal(text) || isAckMsg;
   const preClassify = classifyMessage(text);
 
   // 连续简单消息追踪：如果上一条也是 simple/短消息，判定为收尾模式
@@ -920,7 +1229,10 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
   const consecutiveSimple = (lastMsgType.get(targetName)?.count || 0);
   const isWindingDown = isEnding || (preClassify === "simple" && consecutiveSimple >= 2);
 
-  if (isEnding) {
+  if (isAckMsg && !isWindingDown) {
+    systemPrompt += `\n\n【重要】对方只是确认收到。回得简短自然（3-8字）。关键：只参考你上一轮回复的话题——你上一句说了什么就顺着什么说。不要翻到更早的聊天记录里找别的话题。不要在确认回复里开启新话题。`;
+    console.log(`[ack] ${targetName}: 确认信号，简短回复（可带话题）`);
+  } else if (isEnding) {
     systemPrompt += `\n\n【注意】对方发出了结束对话的信号。简短告别（3-5字），不打理由、不问问题、不抛新话题。告别时参考刚才聊的内容：如果对方说在吃饭就说"好好吃"，如果在休息就说"好好休息"，不要总说"去忙吧"。`;
     console.log(`[ending] ${targetName}: 检测到结束信号`);
   } else if (isWindingDown) {
@@ -958,17 +1270,50 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
 
   const messages = await memory.getContextMessages(targetName, systemPrompt, text);
 
-  // 注入 few-shot 对话示例（在 system 之后、历史之前）
-  const fewShots = getFewShotMessages(persona);
-  messages.splice(1, 0, ...fewShots);
-
   // 写入文件方便诊断
   try { fs.writeFileSync("/app/data/last_system_prompt.txt", systemPrompt, "utf-8"); } catch {}
 
-  console.log(`[diagnose] systemPrompt(${systemPrompt.length}字) + ${fewShots.length}条few-shot → 总${messages.length}条消息`);
+  // 时间间隔检测：如果距上次聊天很久，注入自然的场景过渡
+  {
+    try {
+      const logEntries = readJSONL(`${targetName}.jsonl`, 1);
+      if (logEntries.length > 0) {
+        const lastTime = new Date(logEntries[logEntries.length - 1].time);
+        if (!isNaN(lastTime)) {
+          const gapMin = Math.floor((Date.now() - lastTime.getTime()) / 60000);
+          if (gapMin > 60) {
+            const hr = Math.floor(gapMin / 60);
+            const stateShort = selfState.getContextShort();
+            const gapText = hr >= 3
+              ? `（${hr}个小时过去了。${stateShort ? stateShort.replace("【现在】", "") : ""}）`
+              : `（过了${hr}个多小时。${stateShort ? stateShort.replace("【现在】", "") : ""}）`;
+            messages.push({ role: "system", content: gapText });
+            console.log(`[time-gap] ${targetName}: 距上次${gapMin}分钟，注入场景过渡`);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // few-shot 对话示例：放在历史之后、状态之前
+  // 测试证明，在思考模式下，few-shots 靠近生成点比放在 system 之后更有效
+  const fewShots = getFewShotMessages(persona);
+  messages.push(...fewShots);
 
   // 直接发原文
   messages.push({ role: "user", content: text });
+
+  console.log(`[diagnose] systemPrompt(${systemPrompt.length}字) + ${fewShots.length}条few-shot → 总${messages.length}条消息`);
+
+  // 注入上次生成图片的画面描述 → 模型知道自己发了什么，后续不会瞎编
+  const lastImgPrompt = recentImagePrompt.get(targetName);
+  if (lastImgPrompt) {
+    messages.push({
+      role: "system",
+      content: `【你上次发的图片】你刚给对方发了一张照片，你拍到的画面是："${lastImgPrompt}"。后续聊天如果对方谈到这张图，你的描述必须和这个画面内容一致，不要编造不同场景。`,
+    });
+    recentImagePrompt.delete(targetName);
+  }
 
   // 日间防睡眠误判：用户说累/困/睡觉但现在是白天，提醒模型不要劝睡
   if (/(睡|睡觉|困了|好累|躺|看不动|卷不动|顶不住)/.test(text) && !/(睡了吗|睡着|睡不着|失眠|几点睡|晚睡)/.test(text)) {
@@ -999,9 +1344,11 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
   // 双脑路由（方案三）：按消息类型分流
   let classification = preClassify;
 
-  // 用户想看东西（"看看咪咪""看看猫""看看照片"等）→ 注入生图指令
+  // 用户想看东西（"看看咪咪""看看猫""看看照片"等）→ 注入生图指令 + 强制生图标志
+  let forceImage = false;
   const wantsViewRE = /看看|想看|瞧瞧|瞅瞅|瞧一瞧|看一下|给我看|发.*(照片|图片|图)/;
-  if (wantsViewRE.test(text) && !/看看你|看看我|看看.*[你人己自]/.test(text)) {
+  if (wantsViewRE.test(text) && !/^看看你[了]?$|^看看我[了]?$|看看你自己|看看自己|表情包|表情|贴图|emoji/.test(text)) {
+    forceImage = true;
     const imgFacts = buildImageFacts();
     const factsHint = imgFacts ? `\n你养的宠物外观：${imgFacts}` : "";
     messages.push({
@@ -1032,11 +1379,23 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
   } else {
     maxTok = Math.min(baseTok, 80);
   }
-  // 收尾模式：强制极简 token；simple 消息也限制
-  if (isWindingDown) {
+  // 纯确认：低 token 但够简短带话题（如"好的我去看看"）
+  if (isAckMsg) {
+    maxTok = Math.min(maxTok, 25);
+  } else if (isWindingDown) {
     maxTok = Math.min(maxTok, 15);
   } else if (classification === "simple") {
     maxTok = Math.min(maxTok, 16);
+  }
+
+  const sceneCtx = selfState.getContext();
+
+  // 当前状态注入：放在所有条件消息之后，模型生成前最后看到
+  {
+    const stateShort = selfState.getContextShort();
+    if (stateShort) {
+      messages.push({ role: "system", content: stateShort });
+    }
   }
 
   let reply;
@@ -1057,6 +1416,7 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
         enableTools: false,
         thinking: true,
         reasoningEffort: "medium",
+        sceneContext: sceneCtx,
       });
       break;
 
@@ -1067,6 +1427,7 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
         maxTokens: Math.max(maxTok, 200),
         thinking: true,
         reasoningEffort: "medium",
+        sceneContext: sceneCtx,
       });
       break;
 
@@ -1077,6 +1438,7 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
         maxTokens: Math.max(maxTok, 60),
         thinking: true,
         reasoningEffort: "low",
+        sceneContext: sceneCtx,
       });
       break;
   }
@@ -1092,8 +1454,10 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
   // ── 图片承诺检测：模型承诺了发图但没调工具 → 两步兜底 ──
   {
     const alreadyHasImage = peekGeneratedImage() !== null;
-    if (!alreadyHasImage) {
-      const imagePromiseRE = /(?:给你看|给你拍|拍了[张一]|拍一[张个]|发给你|发给|发张[图照片]|发个[图照片]|发来[图照片]|发一[张个]|看看.*[样照图猫狗崽它]|照片|上图|看图|图片|\b图\b|发了呀|发过了|发了没|往上翻翻|往上翻|翻一翻)/;
+    // 回复中有📎标记 → 这是表情包请求，不是照片，跳过图片fixup
+    const isStickerReply = /📎\S+/.test(reply);
+    if (!alreadyHasImage && !isStickerReply) {
+      const imagePromiseRE = /(?:给你看|给你拍|拍了[张一]|拍一[张个]|[刚就]拍的|拍个[图照片]|发给你|发给|发张[图照片]|发个[图照片]|发来[图照片]|发一[张个]|看看.*[样照图猫狗崽它]|照片|上图|看图|图片|\b图\b|发了呀|发过了|发了没|往上翻翻|往上翻|翻一翻|换了个姿势|来.*看|发.*[图照片])/;
       if (imagePromiseRE.test(reply)) {
         console.log(`[image-fixup] 回复承诺了图片但未调工具，开始兜底...`);
 
@@ -1105,6 +1469,7 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
           maxTokens: Math.max(maxTok, 100),
           thinking: true,
           reasoningEffort: "high",
+          sceneContext: sceneCtx,
         });
 
         // 步骤2：如果模型还是不调工具，我们自己生图
@@ -1113,7 +1478,7 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
           // 从模型回复+对话上下文提取图片描述
           const imgFacts = buildImageFacts();
           const factsHint = imgFacts ? `\n\n关键设定（必须遵守）：${imgFacts}` : "";
-          const refinePrompt = `根据下面这条回复，提取其中描述的具体画面，写成图片生成提示词。\n回复："${reply}"${factsHint}\n\n要求：忠实还原回复中描述的场景、动作、姿态（比如回复说"趴在腿上"就写"趴在腿上"，不要改成"蹲坐"）。10-25字中文。只输出提示词。`;
+          const refinePrompt = `你的回复是："${reply}"${factsHint}\n\n从你的回复中提取图片画面描述。必须100%忠实于回复文字——回复里说什么场景就是什么场景，禁止改动替换或自由发挥。10-25字中文。只输出画面描述。`;
           const prompt = await chatEngine.chatSimple(
             [{ role: "user", content: refinePrompt }],
             { temperature: 0.3, maxTokens: 50 }
@@ -1123,7 +1488,8 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
             const imgResult = await chatEngine.generateImage(prompt.trim());
             if (imgResult) {
               _setGeneratedImage(imgResult);
-              console.log(`[image-fixup] 直接生图成功`);
+              recentImagePrompt.set(targetName, prompt.trim());
+              console.log(`[image-fixup] 直接生图成功，记录上下文`);
             }
           }
         }
@@ -1146,6 +1512,27 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
     }
   }
 
+  // ── 强制生图保障：用户明确要求看图，但模型没调工具也没命中fixup正则 ──
+  if (forceImage && peekGeneratedImage() === null) {
+    console.log(`[image-force] 用户要求看图但未生成，强制执行...`);
+    const imgFacts = buildImageFacts();
+    const factsHint = imgFacts ? `\n关键设定：${imgFacts}` : "";
+    const extractPrompt = `你的回复是："${reply}"${factsHint}\n\n请从你自己的回复中提取你要发的那张图片的画面描述。关键：必须100%忠实于你的回复文字——回复里说什么场景就是什么场景，回复说"趴在腿上"就写趴在腿上，回复说"蹲在阳台"才写蹲在阳台。禁止改动、替换或自由发挥。10-25字中文。只输出画面描述。`;
+    const sceneDesc = await chatEngine.chatSimple(
+      [{ role: "user", content: extractPrompt }],
+      { temperature: 0.3, maxTokens: 50 }
+    );
+    if (sceneDesc) {
+      console.log(`[image-force] 提炼prompt: "${sceneDesc.trim()}"`);
+      const imgResult = await chatEngine.generateImage(sceneDesc.trim());
+      if (imgResult) {
+        _setGeneratedImage(imgResult);
+        recentImagePrompt.set(targetName, sceneDesc.trim());
+        console.log(`[image-force] 强制生图成功，记录上下文`);
+      }
+    }
+  }
+
   // 检测模型输出的 [图片] 标记 → 用 AI 从对话上下文提炼生图描述
   {
     const imgMatch = reply.match(/\[图片\]/);
@@ -1153,7 +1540,7 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
       // 让 AI 根据对方消息和回复上下文，提炼出具体的图片画面描述
       const imgFacts = buildImageFacts();
       const factsHint = imgFacts ? `\n\n重要：你固定养的宠物外观：${imgFacts}` : "";
-      const refinePrompt = `根据下面的对话上下文，提取回复中描述的图片画面，写成图片生成提示词。\n对方说："${text}"\n你的回复："${reply.replace(/\[图片\]\s*/g, '').trim()}"${factsHint}\n\n要求：忠实还原回复中描述的具体场景、动作、姿态，不要自由发挥改动细节。10-25字中文，照片级真实感。只输出提示词。`;
+      const refinePrompt = `你的回复是："${reply.replace(/\[图片\]\s*/g, '').trim()}"${factsHint}\n\n从你的回复中提取图片画面描述。必须100%忠实于回复文字——回复里说什么场景就是什么场景，禁止改动替换或自由发挥。10-25字中文。只输出画面描述。`;
       const refined = await chatEngine.chatSimple(
         [{ role: "user", content: refinePrompt }],
         { temperature: 0.3, maxTokens: 50 }
@@ -1163,6 +1550,7 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
       console.log(`[image-auto] 检测到[图片] → AI提炼: "${prompt}"`);
       const imgUrl = await chatEngine.generateImage(prompt);
       if (imgUrl) {
+        recentImagePrompt.set(targetName, prompt);
         try {
           if (imgUrl.startsWith("http://") || imgUrl.startsWith("https://")) {
             await target.say(FileBox.fromUrl(imgUrl, "generated.jpg"));
@@ -1180,18 +1568,18 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
     }
   }
 
-  // 日间防睡眠回复：如果模型输出包含"休息/睡觉/晚安"等夜间用语 → 拦截
+  // 日间防睡眠回复：如果模型输出包含夜间用语 → 拦截
   {
     const now = new Date();
     const h = now.getHours();
-    if (h >= 6 && h < 21 && /(早点休息|快去睡|赶紧睡|早点睡|晚安|快去休息|好好休息|休息吧|快睡觉|睡吧|明天还要)/.test(reply)) {
-      console.log(`[daytime-block] 拦截日间睡眠回复 (${h}:${now.getMinutes()}): ${reply.substring(0, 30)}`);
-      reply = reply.replace(/(，|。|！|！)?\s*(早点休息|快去睡|赶紧睡|早点睡|晚安|快去休息|好好休息|休息吧|快睡觉|睡吧|明天还要(上班|打工|工作|早起)).*/g, "");
+    if (h >= 6 && h < 22 && /(早点休息|快去睡|赶紧睡|早点睡|晚安|快去休息|好好休息|休息吧|快睡觉|睡吧|明天还要|别太晚睡|太晚睡|不要熬夜|别熬夜|快去睡吧|早点躺|明天早起|明早要|赶紧休息|早休息|快休息|不早了)/.test(reply)) {
+      console.log(`[daytime-block] 拦截日间睡眠回复 (${h}:${now.getMinutes()}): ${reply.substring(0, 40)}`);
+      reply = reply.replace(/(，|。|！|！)?\s*(早点休息|快去睡|赶紧睡|早点睡|晚安|快去休息|好好休息|休息吧|快睡觉|睡吧|别太晚睡|太晚睡|不要熬夜|别熬夜|快去睡吧|早点躺|明天还要(上班|打工|工作|早起)|明天早起|明早要[^\s，。！]{0,10}|赶紧休息|早休息|快休息|不早)[吧啦呢哦啊呀吗了你我他]{0,8}[。！，\s]*/g, "");
       reply = reply.replace(/📎[夜困累睡]/g, "").trim();
       if (!reply || reply.length < 2) {
         reply = "嗯嗯";
       }
-      console.log(`[daytime-block] 修正为: ${reply.substring(0, 30)}`);
+      console.log(`[daytime-block] 修正为: ${reply.substring(0, 40)}`);
     }
   }
 
@@ -1224,19 +1612,26 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
     console.log(`[debounce] ${targetName}: ${pending.length} new msgs during delay, merging`);
     const allText = text + "；" + pending.join("；");
     busyTargets.delete(targetName);
-    return processAndReply(bot, target, targetName, allText, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr);
+    return processAndReply(bot, target, targetName, allText, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState);
   }
+
+  // 修复模型发明的emoji名 → 微信真实名（如 [doge]→[旺柴]）
+  reply = fixEmojiAliases(reply);
+
+  // 模型输出的 emoji 转 📎表情包（仅保留 [OK][好的][握手][抱拳]）
+  reply = convertEmojiToSticker(reply);
 
   // 根据聊天氛围自动决定是否配表情包（不依赖模型📎输出）
   const emotionCtx = emotionTracker.getContext(targetName);
   const autoKw = decideSticker(emotionState, classification, reply);
   if (autoKw && !/📎\S+/.test(reply)) {
-    reply = reply + "📎" + autoKw;
+    reply = "📎" + autoKw + " " + reply;
   }
 
   // 确认发送后才保存记忆（剥离📎指令，避免模型学到输出📎）
   const cleanReply = reply.replace(/📎\S+/g, "").trim();
   memory.saveExchange(targetName, text, cleanReply);
+  selfState.updateFromReply(cleanReply);
 
   // 先发AI生成的图片（如有），再发文字。发了图就不再发同主题表情包
   const imageSent = await sendGeneratedImage(target);
@@ -1245,42 +1640,44 @@ async function processAndReply(bot, target, targetName, text, persona, chatEngin
   }
 
   // 按 "" 拆成多个短消息，按位置交错发送文字和表情包
-  const segments = splitReply(reply);
-  console.log(`[send] ${segments.length}条`);
+  try {
+    const segments = splitReply(reply);
+    console.log(`[send] ${segments.length}条`);
 
-  for (let i = 0; i < segments.length; i++) {
-    if (i > 0) {
-      const gap = 500 + Math.floor(Math.random() * 1000);
-      await new Promise(r => setTimeout(r, gap));
+    for (let i = 0; i < segments.length; i++) {
+      if (i > 0) {
+        const gap = 500 + Math.floor(Math.random() * 1000);
+        await new Promise(r => setTimeout(r, gap));
+      }
+
+      let text = segments[i].trim().replace(/^"|"$/g, "").trim();
+      const m = text.match(/📎(\S+)/);
+
+      if (m) {
+        const keyword = m[1];
+        text = text.replace(/📎\S+/, "").trim();
+        await sendStickerForKeyword(target, keyword, stickerMgr, chatEngine, emotionCtx, reply);
+      }
+
+      if (text) {
+        await target.say(text);
+        console.log(`[sent] "${text.substring(0, 30)}"`);
+      }
     }
-
-    let text = segments[i].trim().replace(/^"|"$/g, "").trim();
-    const m = text.match(/📎(\S+)/);
-
-    if (m) {
-      const keyword = m[1];
-      text = text.replace(/📎\S+/, "").trim();
-      await sendStickerForKeyword(target, keyword, stickerMgr, chatEngine, emotionCtx, reply);
+  } finally {
+    // 释放锁，启动发送后冷却期（无论发送成功与否都要释放）
+    busyTargets.delete(targetName);
+    if (!cooldownBuf.has(targetName)) {
+      cooldownBuf.set(targetName, { target, texts: [] });
     }
-
-    if (text) {
-      await target.say(text);
-      console.log(`[sent] "${text.substring(0, 30)}"`);
+    const cb = cooldownBuf.get(targetName);
+    if (pending.length > 0) {
+      cb.texts.push(pending.join("；"));
+      console.log(`[cooldown] ${targetName}: ${pending.length}条缓冲转入冷却`);
     }
+    if (cb.timer) clearTimeout(cb.timer);
+    cb.timer = setTimeout(() => {
+      try { flushCooldown(targetName, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr, selfState); } catch {}
+    }, COOLDOWN_MS);
   }
-
-  // 释放锁，启动发送后冷却期（缓冲后续消息，等用户说完再回）
-  busyTargets.delete(targetName);
-  if (!cooldownBuf.has(targetName)) {
-    cooldownBuf.set(targetName, { target, texts: [] });
-  }
-  const cb = cooldownBuf.get(targetName);
-  if (pending.length > 0) {
-    cb.texts.push(pending.join("；"));
-    console.log(`[cooldown] ${targetName}: ${pending.length}条缓冲转入冷却`);
-  }
-  if (cb.timer) clearTimeout(cb.timer);
-  cb.timer = setTimeout(() => {
-    flushCooldown(targetName, bot, persona, chatEngine, memory, stickerMgr, emotionTracker, reminderMgr);
-  }, COOLDOWN_MS);
 }

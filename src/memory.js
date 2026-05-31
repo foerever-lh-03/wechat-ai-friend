@@ -1,4 +1,4 @@
-import { readJSONL, appendJSONL, writeJSON, readJSON, shiftJSONL } from "./store.js";
+import { readJSONL, appendJSONL, writeJSON, readJSON, shiftJSONL, readAllJSONL } from "./store.js";
 
 const SUMMARIZE_THRESHOLD = 40;
 const KEEP_RECENT = 30;
@@ -20,12 +20,14 @@ export class MemoryManager {
     this.contextWindow = contextWindow;
     this.memories = new Map();     // friendId -> Map<key, value>
     this.embeddings = new Map();   // friendId -> Map<key, number[]>
+    this.episodic = new Map();     // friendId -> [{date, summary}, ...]
     this._chatEngine = null;
     this._summarizing = new Set();
     this._embedQueue = [];         // 待向量化队列，后台批量处理
     this._embedTimer = null;
     this._loadMemories();
     this._loadEmbeddings();
+    this._loadEpisodic();
   }
 
   setChatEngine(engine) {
@@ -94,6 +96,145 @@ export class MemoryManager {
     writeJSON(this._embFile(), data);
   }
 
+  // ── 情景记忆 ──
+
+  _epiFile() { return "episodic.json"; }
+
+  _loadEpisodic() {
+    const data = readJSON(this._epiFile());
+    if (data) {
+      for (const [friendId, entries] of Object.entries(data)) {
+        // 只保留14天内的
+        const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+        const valid = entries.filter(e => new Date(e.date).getTime() > cutoff);
+        if (valid.length > 0) this.episodic.set(friendId, valid);
+      }
+    }
+  }
+
+  _saveEpisodic() {
+    const data = {};
+    for (const [friendId, entries] of this.episodic) {
+      data[friendId] = entries;
+    }
+    writeJSON(this._epiFile(), data);
+  }
+
+  /** 保存一天的情景摘要 */
+  _saveEpisode(friendId, dateStr, summary) {
+    if (!summary || summary.trim().length < 5) return;
+    if (!this.episodic.has(friendId)) this.episodic.set(friendId, []);
+
+    const entries = this.episodic.get(friendId);
+    // 同一天覆盖
+    const existing = entries.find(e => e.date === dateStr);
+    if (existing) {
+      // 合并：如果新的和旧的不同，拼在一起
+      if (!existing.summary.includes(summary.trim())) {
+        existing.summary = existing.summary + " " + summary.trim();
+      }
+    } else {
+      entries.push({ date: dateStr, summary: summary.trim() });
+    }
+    // 只保留14天
+    if (entries.length > 14) entries.splice(0, entries.length - 14);
+    this._saveEpisodic();
+    console.log(`[memory] 情景记忆 ${friendId}/${dateStr}: ${summary.trim().substring(0, 50)}`);
+  }
+
+  /** 按日期检索情景记忆 */
+  _retrieveEpisodic(friendId, query = "") {
+    const entries = this.episodic.get(friendId);
+    if (!entries || entries.length === 0) return [];
+
+    // 解析日期引用
+    const dateTargets = this._parseDateRefs(query);
+
+    if (dateTargets.length > 0) {
+      // 精确日期匹配
+      const results = [];
+      for (const d of dateTargets) {
+        const hit = entries.find(e => e.date === d);
+        if (hit) results.push(hit);
+      }
+      if (results.length > 0) return results;
+    }
+
+    // 模糊匹配：关键词搜索情景记忆（简单关键词重叠）
+    if (query && query.length > 2) {
+      const tokens = query.split(/[,，。、\s]+/).filter(t => t.length > 1);
+      const scored = entries.map(e => {
+        let score = 0;
+        for (const t of tokens) {
+          if (e.summary.includes(t)) score += 1;
+        }
+        return { ...e, score };
+      }).filter(e => e.score > 0).sort((a, b) => b.score - a.score);
+      if (scored.length > 0) return scored.slice(0, 3);
+    }
+
+    return [];
+  }
+
+  /** 解析中文日期引用 → YYYY-MM-DD */
+  _parseDateRefs(query) {
+    if (!query) return [];
+    const now = new Date();
+    const results = [];
+
+    // 今天/昨天/前天
+    if (/今天|今儿/.test(query)) results.push(this._dateStr(now));
+    if (/昨天|昨儿/.test(query)) results.push(this._dateStr(new Date(now - 86400000)));
+    if (/前天/.test(query)) results.push(this._dateStr(new Date(now - 2 * 86400000)));
+
+    // 大前天 = 3天前
+    const daMatch = query.match(/大前天/);
+    if (daMatch) results.push(this._dateStr(new Date(now - 3 * 86400000)));
+
+    // N天前
+    const dayAgoMatch = query.match(/(\d{1,2})\s*天[之以]?前/);
+    if (dayAgoMatch) results.push(this._dateStr(new Date(now - parseInt(dayAgoMatch[1]) * 86400000)));
+
+    // 周几
+    const weekdayMap = { "日": 0, "天": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6 };
+    const wdMatch = query.match(/周([一二三四五六日天])/);
+    const wd2Match = query.match(/星期([一二三四五六日天])/);
+    const wd = wdMatch ? weekdayMap[wdMatch[1]] : wd2Match ? weekdayMap[wd2Match[1]] : null;
+    if (wd !== null) {
+      const todayWD = now.getDay();
+      let diff = wd - todayWD;
+      if (diff > 0) diff -= 7; // 本周的某天，已经在过去了
+      if (diff === 0) diff = 0; // 今天
+      else if (diff > 0) diff -= 7;
+      results.push(this._dateStr(new Date(now + diff * 86400000)));
+    }
+
+    // 上周X
+    const lwMatch = query.match(/上周([一二三四五六日天])/);
+    if (lwMatch) {
+      const targetWD = weekdayMap[lwMatch[1]];
+      const todayWD = now.getDay();
+      let diff = targetWD - todayWD - 7;
+      results.push(this._dateStr(new Date(now + diff * 86400000)));
+    }
+
+    // 直接日期格式: MM-DD 或 M月D日
+    const dateMatch = query.match(/(\d{1,2})[月\-](\d{1,2})[日号]?/);
+    if (dateMatch) {
+      const m = parseInt(dateMatch[1]);
+      const d = parseInt(dateMatch[2]);
+      if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+        results.push(`${now.getFullYear()}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
+      }
+    }
+
+    return results;
+  }
+
+  _dateStr(date) {
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  }
+
   // ── 后台向量化（不阻塞回复） ──
 
   _scheduleEmbed(friendId, key, value) {
@@ -130,6 +271,20 @@ export class MemoryManager {
     const relevantFacts = await this._retrieveRelevant(friendId, latestUserMsg);
     if (relevantFacts.length > 0) {
       messages[0].content += `\n\n关于对方，你记得：\n${relevantFacts.join("\n")}`;
+    }
+
+    // 情景记忆检索（跨天回忆）
+    const episodes = this._retrieveEpisodic(friendId, latestUserMsg);
+    if (episodes.length > 0) {
+      const todayStr = this._dateStr(new Date());
+      const epiLines = episodes.map(e => {
+        const isToday = e.date === todayStr;
+        const prefix = isToday ? `[今天稍早]` : `[${e.date}]`;
+        return `${prefix} ${e.summary}`;
+      });
+      const note = episodes.some(e => e.date === todayStr)
+        ? "\n（标记\"今天稍早\"的事是几小时前发生的，不代表你现在的状态。）" : "";
+      messages[0].content += `\n\n你记得之前和对方聊过（注意：这些都是过去发生的事，不是现在正在做的事）：\n${epiLines.join("\n")}${note}`;
     }
 
     // 最近对话
@@ -290,11 +445,88 @@ export class MemoryManager {
         : summary;
       this.saveMemory(friendId, "对话摘要", merged);
       console.log(`[memory] ${friendId}: 摘要完成 (${summary.length}字)`);
+
+      // 同时生成情景记忆（按日期归档，用于跨天回忆）
+      const todayStr = this._dateStr(new Date());
+      const epiSummary = await this._chatEngine.chatSimple([
+        {
+          role: "system",
+          content: `你是对话情景记录助手。根据今天的聊天记录，用一两句话总结今天和对方聊了什么、发生了什么值得记住的事。
+用第一人称"我"的视角（你就是说话者本人），像写日记一样自然。
+只输出总结本身，不要加"今天"开头，不要加引号。不超过60字。如果只是纯寒暄没实质性内容，输出"无"。`,
+        },
+        { role: "user", content: conversationText },
+      ], { temperature: 0.4, maxTokens: 150 });
+
+      if (epiSummary && epiSummary !== "无") {
+        this._saveEpisode(friendId, todayStr, epiSummary);
+      }
     } catch (e) {
       console.error(`[memory] 摘要失败 ${friendId}:`, e.message);
     } finally {
       this._summarizing.delete(friendId);
     }
+  }
+
+  // ── 每日总结（每天23:55触发，确保短对话也能被记住）──
+
+  async dailySummarize(friendId) {
+    if (!this._chatEngine) return;
+
+    const todayStr = this._dateStr(new Date());
+    const all = readAllJSONL(`${friendId}.jsonl`);
+
+    // 只取今天的消息
+    const todayMsgs = all.filter(e => e.time && e.time.startsWith(todayStr));
+    if (todayMsgs.length < 2) {
+      console.log(`[memory] ${friendId}: 今天消息太少(${todayMsgs.length}条)，跳过每日总结`);
+      return;
+    }
+
+    console.log(`[memory] ${friendId}: 开始每日总结 (${todayMsgs.length}条)`);
+
+    const lines = todayMsgs.map(e => {
+      const role = e.role === "user" ? "对方" : "我";
+      const time = e.time ? e.time.substring(11, 16) : "";
+      return `${time} ${role}: ${e.content}`;
+    });
+
+    // 检查今天是否已有情景记忆（合并而不是覆盖）
+    const existingEpi = this.episodic.get(friendId)?.find(e => e.date === todayStr);
+
+    // 生成情景总结
+    const epiSummary = await this._chatEngine.chatSimple([
+      {
+        role: "system",
+        content: `你是对话情景记录助手。根据今天的聊天记录，用一两句话总结今天和对方聊了什么、发生了什么值得记住的事。
+用第一人称"我"的视角（你就是说话者本人），像写日记一样自然。
+只输出总结本身，不要加"今天"开头，不要加引号。不超过60字。如果只是纯寒暄没实质性内容，输出"无"。`,
+      },
+      { role: "user", content: lines.join("\n") },
+    ], { temperature: 0.4, maxTokens: 150 });
+
+    if (epiSummary && epiSummary !== "无") {
+      this._saveEpisode(friendId, todayStr, epiSummary);
+    }
+
+    // 生成事实提取
+    const factSummary = await this._chatEngine.chatSimple([
+      {
+        role: "system",
+        content: `你是对话摘要助手。从聊天记录中提取值得记住的关键信息。忽略寒暄、表情、日常废话。
+只提取：个人事实（名字、职业、地点、爱好、宠物）、约定/计划（时间地点）、明确偏好（喜欢/讨厌什么）、重要经历。
+用简洁中文，每条一行，格式："- 事实描述"。如果没有任何值得记的内容，输出"无"。`,
+      },
+      { role: "user", content: lines.join("\n") },
+    ], { temperature: 0.3, maxTokens: 300 });
+
+    if (factSummary && factSummary !== "无") {
+      const existing = this.memories.get(friendId)?.get("对话摘要") || "";
+      const merged = existing ? existing + "\n" + factSummary : factSummary;
+      this.saveMemory(friendId, "对话摘要", merged);
+    }
+
+    console.log(`[memory] ${friendId}: 每日总结完成`);
   }
 
   // ── 事实提取 ──

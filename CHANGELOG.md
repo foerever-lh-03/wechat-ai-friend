@@ -85,4 +85,40 @@
 
 ### 部署
 - 服务端：120.53.225.115 `/opt/wechat-bot/`，Docker `wechat-ai-friend`
-- 配置挂载：`./src`、`./config`、`./data` 为 volume
+- 配置挂载：`./src`、`./config`、`./data`、`./stickers` 为 volume
+
+## 2026-05-28
+
+### 自我状态追踪 (`src/self-state.js`) — 新增
+- 时间驱动自动切换状态：工作日 9:00→通勤，9:30→公司上班，12:00→午休吃饭，14:00→下午工作，18:30→下班通勤，19:30→在家休息。周末默认在家
+- bot 自己的回复可触发状态记录（正则匹配位置和活动关键词），1 小时内且与时间推断一致时采用
+- 时间线功能：当天所有状态轨迹注入 system prompt，标注"过去发生的事"
+- 当前时间显示：`现在是周三 14:00`，让模型有准确时间感知
+- 场景约束：位置感知（如：公司时猫在家，只能通过监控查看）
+
+### 情景记忆 (`src/memory.js`) — 新增
+- 按日期归档对话情景摘要（episodic memory），支持跨天回忆
+- 日期引用解析：今天/昨天/前天/N天前/周X/上周X/M月D日
+- 情境记忆注入时标注 `[今天稍早]` 或 `[YYYY-MM-DD]`，注明"过去发生的事，不代表现在的状态"
+- 每天 23:55 定时触发每日总结（`dailySummarize`）：读取当天全部消息 → AI 生成情景摘要+事实摘要 → 归档
+- 短对话也能被记住（不再依赖 40 条阈值触发）
+- `getContextMessages` 自动注入匹配的情景记忆到 system prompt
+
+### 表情包 (`src/sticker.js`)
+- **删除 API盒子 和 MemeMeow 在线源**，发表情(fabiaoqing.com)为唯一在线源（~80行代码删除）
+- 本地文件/用户表情包跳过视觉检查（目录分类+AI标签=质量保证）
+- 缓存 URL 改为强制视觉检查（原来跳过，导致坏图反复发送）
+- 后备关键词走完整搜索链（本地→用户→缓存→发表情），不再降级纯 emoji
+
+### 图片生成场景感知 (`src/tools.js`, `src/chat.js`)
+- `generate_image` 工具执行时注入当前 self-state 场景上下文
+- 生图 prompt 结构：`【当前真实场景】... 【画面描述】... 请综合以上信息，生成与当前场景一致的画面`
+- `chat()` 新增 `sceneContext` 参数透传到工具执行层
+
+### Bot 修复 (`src/bot.js`)
+- 修复 `selfState is not defined` 多次 crash：补齐 `flushCooldown`/`flushDebounced`/`proactiveTick`/`startProactiveScheduler` 的 selfState 参数传递链（6个函数签名+5个调用点）
+- 表情包发送：本地文件优先（免检），在线结果必须过视觉验证
+- 每日总结调度器：login 后计算到 23:55 的延迟，首次 setTimeout 之后每 24h setInterval
+
+### 数据层 (`src/store.js`)
+- 新增 `readAllJSONL()` 读取全部记录（用于每日总结）

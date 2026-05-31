@@ -8,5 +8,6 @@ temp_stickers/
 *.tar.gz
 *.zip
 *.memory-card.json
+test_*.js
 .DS_Store
 Thumbs.db

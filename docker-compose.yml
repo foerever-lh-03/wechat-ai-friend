@@ -9,6 +9,7 @@ services:
       - ./data:/app/data
       - ./config:/app/config
       - ./src:/app/src
+      - ./stickers:/app/stickers
       - ./wechat-ai-friend.memory-card.json:/app/wechat-ai-friend.memory-card.json
     logging:
       driver: "json-file"

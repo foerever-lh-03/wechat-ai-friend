@@ -119,7 +119,7 @@ export class ChatEngine {
       const fnArgs = JSON.parse(toolCall.function.arguments || "{}");
       console.log(`[agent] 调用工具: ${fnName}(${JSON.stringify(fnArgs)})`);
 
-      const result = await executeTool(fnName, fnArgs, this);
+      const result = await executeTool(fnName, fnArgs, this, options.sceneContext);
 
       ctx.push({
         role: "assistant",
@@ -208,8 +208,10 @@ export class ChatEngine {
    * AI 图片生成
    * 使用智谱 CogView-3-Flash（免费），下载后裁剪底部水印
    * 返回本地文件路径，失败返回 null
+   * @param {string} prompt - 图片描述
+   * @param {object} options - { lighting: "day"|"night"|"auto"|custom string }
    */
-  async generateImage(prompt) {
+  async generateImage(prompt, options = {}) {
     const visionKey = this.config.visionApiKey;
     if (!visionKey) {
       console.log("[image-gen] 智谱 API key 未配置");
@@ -221,7 +223,22 @@ export class ChatEngine {
       baseURL: "https://open.bigmodel.cn/api/paas/v4/",
     });
 
-    const fullPrompt = prompt + "，照片级真实感，自然光线";
+    // 时间感知光线：根据当前时间自动推断场景氛围
+    let lightingHint;
+    const lighting = options.lighting || "auto";
+    if (lighting !== "auto") {
+      lightingHint = lighting === "day" ? "自然光线" : lighting === "night" ? "夜晚室内温暖灯光" : lighting;
+    } else {
+      const hour = new Date().getHours();
+      if (hour >= 20 || hour < 6) {
+        lightingHint = "夜晚，室内温暖灯光";
+      } else if (hour >= 18 || hour < 7) {
+        lightingHint = "傍晚，暖色调灯光";
+      } else {
+        lightingHint = "自然光线";
+      }
+    }
+    const fullPrompt = `${prompt}，照片级真实感，${lightingHint}`;
 
     try {
       const response = await visionClient.images.generate({
@@ -239,7 +256,7 @@ export class ChatEngine {
       console.log(`[image-gen] CogView 生成: ${fullPrompt.substring(0, 50)}`);
 
       // 下载 + 裁剪底部水印 + 保存本地
-      const localPath = await this._downloadAndCrop(url);
+      const localPath = await this._downloadAndInpaint(url);
       return localPath || url; // 裁剪失败则返回原始URL兜底
     } catch (e) {
       console.warn(`[image-gen] CogView 失败:`, e.message);
@@ -247,8 +264,8 @@ export class ChatEngine {
     }
   }
 
-  /** 下载图片并裁剪底部36px（去除"AI生成"水印） */
-  async _downloadAndCrop(url) {
+  /** 下载图片并用 inpainting 去除底部水印（检测半透明白色文字 → 水平插值） */
+  async _downloadAndInpaint(url) {
     try {
       const { Jimp } = await import("jimp");
       const response = await fetch(url, {
@@ -259,19 +276,101 @@ export class ChatEngine {
 
       const buffer = Buffer.from(await response.arrayBuffer());
       const img = await Jimp.read(buffer);
-      const cropH = img.height - 40; // 裁掉底部40px水印（CogView水印约36px，多点保险）
+      const { width: w, height: h, data } = img.bitmap;
+      const roiTop = Math.floor(h * 0.85);   // 底部15%区域
+      const winHalf = 15;                     // 水平窗口半宽
 
-      img.crop({ x: 0, y: 0, w: img.width, h: cropH });
-      const cropped = await img.getBuffer("image/jpeg", { quality: 92 });
+      for (let y = roiTop; y < h; y++) {
+        const rowOff = y * w * 4;
 
+        // Pass 1: 检测水印像素
+        // 水印特征：白色/浅灰（RGB接近且都偏高），且比局部背景更亮
+        const flags = new Uint8Array(w);
+        for (let x = 0; x < w; x++) {
+          const i = rowOff + x * 4;
+          const r = data[i], g = data[i + 1], b = data[i + 2];
+          const maxC = Math.max(r, g, b), minC = Math.min(r, g, b);
+          const saturation = maxC - minC;
+          const brightness = (r + g + b) / 3;
+          // 白色文字：低饱和（RGB接近）、高亮度
+          const isWhiteish = saturation < 40 && brightness > 170;
+          if (!isWhiteish) continue;
+
+          // 与水平窗口中非白像素的亮度对比
+          let bgSum = 0, bgCnt = 0;
+          const x0 = Math.max(0, x - winHalf), x1 = Math.min(w - 1, x + winHalf);
+          for (let wx = x0; wx <= x1; wx++) {
+            const wi = rowOff + wx * 4;
+            const wr = data[wi], wg = data[wi + 1], wb = data[wi + 2];
+            const wSat = Math.max(wr, wg, wb) - Math.min(wr, wg, wb);
+            if (wSat > 30 || (wr + wg + wb) / 3 < 170) { // 非白像素=背景
+              bgSum += (wr + wg + wb) / 3;
+              bgCnt++;
+            }
+          }
+          if (bgCnt >= 3 && brightness > bgSum / bgCnt + 35) {
+            flags[x] = 1;
+          }
+        }
+
+        // Pass 2: 合并连续段（容忍 ≤4px 间隙）
+        const mask = [];
+        let seg = null;
+        for (let x = 0; x < w; x++) {
+          if (flags[x]) {
+            if (!seg) seg = { start: x, end: x };
+            else seg.end = x;
+          } else if (seg) {
+            let gapEnd = x;
+            while (gapEnd < w && !flags[gapEnd] && gapEnd - x < 4) gapEnd++;
+            if (gapEnd < w && flags[gapEnd]) { seg.end = gapEnd; x = gapEnd; }
+            else { if (seg.end - seg.start >= 2) mask.push(seg); seg = null; }
+          }
+        }
+        if (seg && seg.end - seg.start >= 2) mask.push(seg);
+
+        // Pass 3: 水平插值填充
+        for (const seg of mask) {
+          const s = seg.start, e = seg.end;
+          const len = e - s + 1;
+          for (let dx = 0; dx < len; dx++) {
+            const x = s + dx;
+            const ti = rowOff + x * 4;
+            const t = (dx + 1) / (len + 1);
+
+            // 找左邻非水印像素（可跨段外）
+            let lr = -1, lg = -1, lb = -1;
+            for (let lx = s - 1; lx >= Math.max(0, s - 30); lx--) {
+              if (!flags[lx]) { const li = rowOff + lx * 4; lr = data[li]; lg = data[li + 1]; lb = data[li + 2]; break; }
+            }
+            let rr = -1, rg = -1, rb = -1;
+            for (let rx = e + 1; rx < Math.min(w, e + 30); rx++) {
+              if (!flags[rx]) { const ri = rowOff + rx * 4; rr = data[ri]; rg = data[ri + 1]; rb = data[ri + 2]; break; }
+            }
+            // 水平方向找不到就用上方像素
+            if (lr < 0) {
+              const aboveI = (Math.max(roiTop, y - 1) * w + x) * 4;
+              lr = data[aboveI]; lg = data[aboveI + 1]; lb = data[aboveI + 2];
+            }
+            if (rr < 0) rr = lr, rg = lg, rb = lb;
+
+            data[ti]     = Math.round(lr * (1 - t) + rr * t);
+            data[ti + 1] = Math.round(lg * (1 - t) + rg * t);
+            data[ti + 2] = Math.round(lb * (1 - t) + rb * t);
+            data[ti + 3] = 255;
+          }
+        }
+      }
+
+      const processed = await img.getBuffer("image/jpeg", { quality: 92 });
       const dir = path.resolve("/app/data/generated");
       fs.mkdirSync(dir, { recursive: true });
       const filePath = path.join(dir, `gen_${Date.now()}.jpg`);
-      fs.writeFileSync(filePath, cropped);
-      console.log(`[image-gen] 去水印裁剪(${img.width}x${img.height}→${cropH}) → ${path.basename(filePath)}`);
+      fs.writeFileSync(filePath, processed);
+      console.log(`[image-gen] inpainting去水印(${w}x${h}) → ${path.basename(filePath)}`);
       return filePath;
     } catch (e) {
-      console.warn(`[image-gen] 裁剪失败:`, e.message);
+      console.warn(`[image-gen] inpainting失败:`, e.message);
       return null;
     }
   }
