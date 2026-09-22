@@ -41,7 +41,7 @@
 ### 1. 克隆并安装
 
 ```bash
-git clone https://github.com/你的用户名/wechat-ai-friend.git
+git clone https://github.com/foerever-lh-03/wechat-ai-friend.git
 cd wechat-ai-friend
 npm install
 ```
